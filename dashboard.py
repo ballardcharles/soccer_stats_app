@@ -325,18 +325,43 @@ elif view == "🔥 Event Heatmaps":
 
     event_types = sorted(events["type"].dropna().unique()) if "type" in events.columns else []
 
-    f1, f2, f3 = st.columns(3)
-    with f1:
+    # Row 1: Team → Match (match list depends on selected team)
+    r1a, r1b = st.columns([1, 3])
+    with r1a:
         sel_team = st.selectbox("Team:", team_list(events, "team"))
-    with f2:
+
+    team_events_all = events[events["team"] == sel_team].copy()
+
+    with r1b:
+        if {"match_date", "home_team", "away_team"}.issubset(team_events_all.columns):
+            team_events_all["match_date"] = pd.to_datetime(
+                team_events_all["match_date"], errors="coerce"
+            )
+            match_opts = (
+                team_events_all.dropna(subset=["match_date", "home_team", "away_team"])
+                .assign(label=lambda df: df.apply(match_label, axis=1))
+                .drop_duplicates("label")
+                .sort_values("match_date", ascending=False)["label"]
+                .tolist()
+            )
+            sel_match = st.selectbox("Match:", ["All Matches"] + match_opts)
+        else:
+            sel_match = "All Matches"
+
+    # Row 2: Event types + Period
+    r2a, r2b = st.columns([3, 1])
+    with r2a:
         default_types = [t for t in ["Pass", "BallTouch", "TackleX"] if t in event_types]
         sel_types = st.multiselect("Event Types:", event_types,
                                    default=default_types or event_types[:3])
-    with f3:
+    with r2b:
         sel_period = st.selectbox("Period:", ["Full Match", "1st Half", "2nd Half"])
 
     # Filter
-    ev = events[events["team"] == sel_team].copy()
+    ev = team_events_all.copy()
+    if sel_match != "All Matches":
+        ev_labels = ev.apply(match_label, axis=1)
+        ev = ev[ev_labels == sel_match]
     if sel_types:
         ev = ev[ev["type"].isin(sel_types)]
     if sel_period == "1st Half" and "period" in ev.columns:
@@ -368,9 +393,10 @@ elif view == "🔥 Event Heatmaps":
         zorder=2,
     )
 
-    type_str = ", ".join(sel_types) if sel_types else "All Events"
-    ax.set_title(f"{sel_team}  ·  {type_str}  ({sel_period})",
-                fontsize=13, fontweight="bold", color="white", pad=12)
+    type_str  = ", ".join(sel_types) if sel_types else "All Events"
+    match_str = sel_match if sel_match != "All Matches" else "All Matches"
+    ax.set_title(f"{sel_team}  ·  {type_str}  ·  {match_str}  ({sel_period})",
+                fontsize=12, fontweight="bold", color="white", pad=12)
     fig.patch.set_facecolor("#0e1117")
     st.pyplot(fig)
 

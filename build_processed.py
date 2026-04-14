@@ -3,32 +3,27 @@ build_processed.py
 ------------------
 Builds clean, cross-source, analysis-ready datasets from raw collector output.
 
+Automatically detects every season that has an Understat matches file in
+data/raw_understat/ and processes them all.  Add a new season simply by
+running the collectors for it — no config change needed here.
+
 Run after each collection cycle:
     python build_processed.py
 
 Output files  (data/processed/)
 --------------------------------
 match_crossref.csv   Links all three source match IDs via (date, home_team, away_team).
-                     This is the keystone — every other processed file joins through it.
-
-shots.csv            Understat shot-level data.
-                     Coords normalized to [0,100]. Canonical team names.
-                     Crossref IDs (espn_game_id, whoscored_game_id) attached.
-
-events.csv           WhoScored full event stream.
-                     Canonical team names. Crossref IDs attached.
-                     Suitable for heatmaps, pressure maps, pass networks.
-
+shots.csv            Understat shot-level data. Coords in [0,100]. Canonical team names.
+events.csv           WhoScored full event stream with crossref IDs.
 match_summary.csv    One row per match. Understat xG + forecasts + ESPN team stats.
-                     Central table for match-level analysis and predictive modelling.
-
 lineups.csv          ESPN lineup data. Canonical team names. Crossref IDs attached.
-
 player_season.csv    Understat player season stats. Canonical team names.
 
-Season config — update these each season (keep in sync with run_collection.py):
+All output files contain a 'season' column (e.g. '2024/25') so the dashboard
+can filter by season without needing separate files per year.
 """
 
+import re
 import sys
 import pandas as pd
 from pathlib import Path
@@ -37,12 +32,9 @@ from src.sanitize import canonicalize_teams, normalize_coords, normalize_date
 from src.utils import ensure_dir
 
 # ---------------------------------------------------------------------------
-# Season config — update each season
+# League identifiers (fixed — only the year changes each season)
 # ---------------------------------------------------------------------------
 
-US_SEASON   = 2025               # Understat: int start year
-ESPN_SEASON = "2025"             # ESPN: string
-WS_SEASON   = "2025"             # WhoScored: string
 US_LEAGUE   = "EPL"
 ESPN_LEAGUE = "ENG-Premier League"
 WS_LEAGUE   = "ENG-Premier League"
@@ -58,29 +50,70 @@ OUT      = Path("data/processed")
 
 
 # ---------------------------------------------------------------------------
-# Load
+# Season helpers
 # ---------------------------------------------------------------------------
 
-def load_raw() -> dict[str, pd.DataFrame]:
-    """Load all raw data files. Warns and skips any that are missing."""
+def season_label(us_year: int) -> str:
+    """Convert an Understat year integer to a display label.
+
+    The Understat year represents the END calendar year of the season.
+    Examples:
+        2025  ->  '2024/25'
+        2024  ->  '2023/24'
+        2023  ->  '2022/23'
+    """
+    return f"{us_year - 1}/{str(us_year)[2:]}"
+
+
+def detect_seasons() -> list[int]:
+    """Scan raw_understat/ for all available seasons.
+
+    Looks for files matching 'EPL_{year}_matches.csv' and returns the
+    sorted list of year integers found.  This means build_processed.py
+    automatically picks up new seasons as soon as the collector has run —
+    no manual config update required.
+    """
+    pattern = re.compile(r"EPL_(\d{4})_matches\.csv")
+    seasons = []
+    for f in RAW_US.glob("EPL_*_matches.csv"):
+        m = pattern.match(f.name)
+        if m:
+            seasons.append(int(m.group(1)))
+    if not seasons:
+        print("  No Understat match files found in data/raw_understat/")
+        print("  Run `python run_collection.py` first.")
+    return sorted(seasons)
+
+
+# ---------------------------------------------------------------------------
+# Load raw data for a single season
+# ---------------------------------------------------------------------------
+
+def load_raw(us_season: int) -> dict[str, pd.DataFrame]:
+    """Load all raw source files for one season.
+
+    Missing files are returned as empty DataFrames — build functions
+    downstream handle absent data gracefully.
+    """
+    espn_season = str(us_season)
+    ws_season   = str(us_season)
+
     sources = {
-        "us_matches":    RAW_US   / f"{US_LEAGUE}_{US_SEASON}_matches.csv",
-        "us_shots":      RAW_US   / f"{US_LEAGUE}_{US_SEASON}_shots.csv",
-        "us_players":    RAW_US   / f"{US_LEAGUE}_{US_SEASON}_players.csv",
-        "espn_schedule": RAW_ESPN / f"{ESPN_LEAGUE}_{ESPN_SEASON}_team_schedule.csv",
-        "espn_stats":    RAW_ESPN / f"{ESPN_LEAGUE}_{ESPN_SEASON}_match_stats.csv",
-        "espn_lineups":  RAW_ESPN / f"{ESPN_LEAGUE}_{ESPN_SEASON}_team_lineups.csv",
-        "ws_events":     RAW_WS   / f"{WS_LEAGUE}_{WS_SEASON}_events.csv",
-        "ws_schedule":   RAW_WS   / f"{WS_LEAGUE}_{WS_SEASON}_schedule.csv",
+        "us_matches":    RAW_US   / f"{US_LEAGUE}_{us_season}_matches.csv",
+        "us_shots":      RAW_US   / f"{US_LEAGUE}_{us_season}_shots.csv",
+        "us_players":    RAW_US   / f"{US_LEAGUE}_{us_season}_players.csv",
+        "espn_schedule": RAW_ESPN / f"{ESPN_LEAGUE}_{espn_season}_team_schedule.csv",
+        "espn_stats":    RAW_ESPN / f"{ESPN_LEAGUE}_{espn_season}_match_stats.csv",
+        "espn_lineups":  RAW_ESPN / f"{ESPN_LEAGUE}_{espn_season}_team_lineups.csv",
+        "ws_events":     RAW_WS   / f"{WS_LEAGUE}_{ws_season}_events.csv",
+        "ws_schedule":   RAW_WS   / f"{WS_LEAGUE}_{ws_season}_schedule.csv",
     }
     data = {}
     for name, path in sources.items():
         if not path.exists():
-            print(f"  ⚠ Missing: {path} — {name} will be skipped")
             data[name] = pd.DataFrame()
         else:
             data[name] = pd.read_csv(path, low_memory=False)
-            print(f"  {name:<18} {len(data[name]):>6} rows   ({path.name})")
     return data
 
 
@@ -88,18 +121,16 @@ def load_raw() -> dict[str, pd.DataFrame]:
 # 1. Match crossref
 # ---------------------------------------------------------------------------
 
-def build_match_crossref(data: dict) -> pd.DataFrame:
+def build_match_crossref(data: dict, us_season: int) -> pd.DataFrame:
     """
-    Build a table that links Understat, ESPN, and WhoScored match IDs.
+    Build a table linking Understat, ESPN, and WhoScored match IDs.
 
     Join key: (match_date as date, canonical home_team, canonical away_team).
-    Understat is the spine (380 rows for a full PL season).
-    ESPN and WhoScored IDs are left-joined in.
+    Understat is the spine. ESPN and WhoScored IDs are left-joined in.
+    A 'season' column is added so rows from all seasons can be combined.
     """
-    # --- Understat (spine) ---
     us = data["us_matches"].copy()
     if us.empty:
-        print("  ⚠ Understat matches missing — cannot build crossref")
         return pd.DataFrame()
 
     canonicalize_teams(us, "home_team", "away_team")
@@ -110,7 +141,7 @@ def build_match_crossref(data: dict) -> pd.DataFrame:
         "home_xg", "away_xg", "forecast_win", "forecast_draw", "forecast_loss",
     ]].rename(columns={"match_id": "understat_match_id"})
 
-    # --- ESPN ---
+    # ESPN
     espn_key = pd.DataFrame()
     if not data["espn_schedule"].empty:
         espn = data["espn_schedule"].copy()
@@ -120,7 +151,7 @@ def build_match_crossref(data: dict) -> pd.DataFrame:
             columns={"game_id": "espn_game_id", "game": "espn_game_str"}
         )
 
-    # --- WhoScored ---
+    # WhoScored
     ws_key = pd.DataFrame()
     if not data["ws_schedule"].empty:
         ws = data["ws_schedule"].copy()
@@ -130,12 +161,12 @@ def build_match_crossref(data: dict) -> pd.DataFrame:
             columns={"game_id": "whoscored_game_id"}
         )
 
-    # --- Join ---
+    # Join
     crossref = us_key.copy()
     if not espn_key.empty:
         crossref = crossref.merge(espn_key, on=["match_date", "home_team", "away_team"], how="left")
     else:
-        crossref["espn_game_id"] = pd.NA
+        crossref["espn_game_id"]  = pd.NA
         crossref["espn_game_str"] = pd.NA
 
     if not ws_key.empty:
@@ -143,27 +174,22 @@ def build_match_crossref(data: dict) -> pd.DataFrame:
     else:
         crossref["whoscored_game_id"] = pd.NA
 
-    n = len(crossref)
+    crossref["season"] = season_label(us_season)
+
+    n      = len(crossref)
     n_espn = crossref["espn_game_id"].notna().sum()
     n_ws   = crossref["whoscored_game_id"].notna().sum()
-    print(f"  Matches:             {n}")
-    print(f"  Linked to ESPN:      {n_espn}/{n} ({100*n_espn//n}%)")
-    print(f"  Linked to WhoScored: {n_ws}/{n} ({100*n_ws//n}%)")
+    pct_e  = (100 * n_espn // n) if n else 0
+    pct_w  = (100 * n_ws   // n) if n else 0
+    print(f"    {n} matches  |  ESPN {n_espn}/{n} ({pct_e}%)  |  WhoScored {n_ws}/{n} ({pct_w}%)")
 
-    today = pd.Timestamp.now().date()
-    unmatched = crossref[crossref["espn_game_id"].isna() | crossref["whoscored_game_id"].isna()].copy()
-    if not unmatched.empty:
-        future   = unmatched[pd.to_datetime(unmatched["match_date"]).dt.date > today]
-        past_gap = unmatched[pd.to_datetime(unmatched["match_date"]).dt.date <= today]
-        if not future.empty:
-            print(f"  Unmatched (future, expected): {len(future)}")
-        if not past_gap.empty:
-            print(f"  ⚠ Unmatched (past — may need re-collection): {len(past_gap)}")
-            for _, r in past_gap.iterrows():
-                missing = []
-                if pd.isna(r.get("espn_game_id")):      missing.append("ESPN")
-                if pd.isna(r.get("whoscored_game_id")): missing.append("WhoScored")
-                print(f"    {r['match_date']}  {r['home_team']} v {r['away_team']}  [{', '.join(missing)}]")
+    today    = pd.Timestamp.now().date()
+    past_gap = crossref[
+        (crossref["espn_game_id"].isna() | crossref["whoscored_game_id"].isna()) &
+        (pd.to_datetime(crossref["match_date"]).dt.date <= today)
+    ]
+    if not past_gap.empty:
+        print(f"    ⚠  {len(past_gap)} past match(es) missing source links")
 
     return crossref.sort_values(["match_date", "home_team"]).reset_index(drop=True)
 
@@ -172,20 +198,14 @@ def build_match_crossref(data: dict) -> pd.DataFrame:
 # 2. Shots
 # ---------------------------------------------------------------------------
 
-def build_shots(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
-    """
-    Understat shot-level data with:
-      - Coords normalized from [0,1] → [0,100]
-      - Canonical team name derived from home/away side
-      - Crossref IDs (espn_game_id, whoscored_game_id) attached
-    """
+def build_shots(data: dict, crossref: pd.DataFrame, us_season: int) -> pd.DataFrame:
+    """Understat shot-level data with normalised coords and crossref IDs."""
     shots = data["us_shots"].copy()
     if shots.empty:
         return shots
 
     shots = normalize_coords(shots, source="understat")
 
-    # Attach crossref info
     xref_cols = ["understat_match_id", "home_team", "away_team",
                  "match_date", "espn_game_id", "whoscored_game_id"]
     available = [c for c in xref_cols if c in crossref.columns]
@@ -196,12 +216,12 @@ def build_shots(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
         how="left",
     ).drop(columns=["understat_match_id"], errors="ignore")
 
-    # Canonical team for this shot (home or away)
     shots["team"]     = shots.apply(lambda r: r["home_team"] if r["side"] == "home" else r["away_team"], axis=1)
     shots["opponent"] = shots.apply(lambda r: r["away_team"] if r["side"] == "home" else r["home_team"], axis=1)
+    shots["season"]   = season_label(us_season)
 
     col_order = [
-        "match_id", "espn_game_id", "whoscored_game_id",
+        "season", "match_id", "espn_game_id", "whoscored_game_id",
         "match_date", "team", "opponent", "side",
         "player", "player_id", "minute",
         "x", "y", "xg", "result", "shot_type", "situation",
@@ -213,12 +233,8 @@ def build_shots(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
 # 3. Events
 # ---------------------------------------------------------------------------
 
-def build_events(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
-    """
-    WhoScored full event stream with canonical team names and crossref IDs.
-    The 'qualifiers' column (nested JSON-like strings) is kept raw — parse
-    it in your analysis code as needed.
-    """
+def build_events(data: dict, crossref: pd.DataFrame, us_season: int) -> pd.DataFrame:
+    """WhoScored full event stream with canonical team names and crossref IDs."""
     events = data["ws_events"].copy()
     if events.empty:
         return events
@@ -236,6 +252,7 @@ def build_events(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
         events["game_id"] = events["game_id"].astype("Int64")
         events = events.merge(xref, left_on="game_id", right_on="whoscored_game_id", how="left")
 
+    events["season"] = season_label(us_season)
     return events
 
 
@@ -243,35 +260,18 @@ def build_events(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
 # 4. Match summary
 # ---------------------------------------------------------------------------
 
-def build_match_summary(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
-    """
-    One row per match.
-
-    Columns come from three sources:
-      - Understat: xG, goals, forecasts  (always present)
-      - ESPN:      possession, shots, passes, etc. (per-team stats pivoted wide)
-      - Spine:     crossref IDs, date, teams
-
-    ESPN stats join requires the 'game' column, which is only present in
-    ESPN match_stats files generated after the collector was updated to save
-    with reset_index(). If missing, the summary still contains all Understat
-    data — re-run pull_espn_data() to populate the ESPN columns.
-    """
+def build_match_summary(data: dict, crossref: pd.DataFrame, us_season: int) -> pd.DataFrame:
+    """One row per match: Understat xG + forecasts + ESPN team stats (if available)."""
     summary = crossref.copy()
 
     espn_stats = data["espn_stats"].copy()
 
     if espn_stats.empty or "game" not in espn_stats.columns:
-        print("  ⚠ ESPN match stats missing 'game' column.")
-        print("    Re-run pull_espn_data() to generate the updated format,")
-        print("    then re-run build_processed.py to fill ESPN columns.")
         return summary
 
-    # Drop the embedded roster JSON — it's large and lives in espn_lineups instead
     if "roster" in espn_stats.columns:
         espn_stats = espn_stats.drop(columns=["roster"])
 
-    # Attach espn_game_id via the schedule's game-string → game_id mapping
     espn_sched = data["espn_schedule"]
     if not espn_sched.empty and "game" in espn_sched.columns:
         game_to_id = espn_sched.set_index("game")["game_id"].to_dict()
@@ -279,7 +279,6 @@ def build_match_summary(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
     else:
         return summary
 
-    # Pivot to wide: one row per match with home_ and away_ prefixed columns
     home = espn_stats[espn_stats["is_home"] == True].copy()
     away = espn_stats[espn_stats["is_home"] == False].copy()
 
@@ -292,10 +291,7 @@ def build_match_summary(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
                  .rename(columns={c: f"away_{c}" for c in stat_cols}))
 
     espn_wide = home_wide.merge(away_wide, on="espn_game_id", how="outer")
-    summary = summary.merge(espn_wide, on="espn_game_id", how="left")
-
-    espn_matched = summary["venue"].notna().sum()
-    print(f"  ESPN stats joined for {espn_matched}/{len(summary)} matches")
+    summary   = summary.merge(espn_wide, on="espn_game_id", how="left")
 
     return summary
 
@@ -304,10 +300,8 @@ def build_match_summary(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
 # 5. Lineups
 # ---------------------------------------------------------------------------
 
-def build_lineups(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
-    """
-    ESPN lineup data with canonical team names and all three source match IDs.
-    """
+def build_lineups(data: dict, crossref: pd.DataFrame, us_season: int) -> pd.DataFrame:
+    """ESPN lineup data with canonical team names and all three source match IDs."""
     lineups = data["espn_lineups"].copy()
     if lineups.empty:
         return lineups
@@ -317,7 +311,6 @@ def build_lineups(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
 
     canonicalize_teams(lineups, "team")
 
-    # Map ESPN game string → espn_game_id, then join crossref
     espn_sched = data["espn_schedule"]
     if not espn_sched.empty and "game" in espn_sched.columns and "game" in lineups.columns:
         game_to_id = espn_sched.set_index("game")["game_id"].to_dict()
@@ -327,6 +320,7 @@ def build_lineups(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
                               "whoscored_game_id", "match_date"]].copy()
         lineups = lineups.merge(xref_ids, on="espn_game_id", how="left")
 
+    lineups["season"] = season_label(us_season)
     return lineups
 
 
@@ -334,31 +328,25 @@ def build_lineups(data: dict, crossref: pd.DataFrame) -> pd.DataFrame:
 # 6. Player season stats
 # ---------------------------------------------------------------------------
 
-def build_player_season(data: dict) -> pd.DataFrame:
-    """
-    Understat player season stats with canonical team names.
-
-    Understat uses comma-separated team strings for mid-season transfers
-    (e.g. "Bournemouth,Manchester City"). The 'team' column is kept as-is
-    (after canonicalization) for full history. A 'primary_team' column is
-    added with the player's most recent club (last in the list).
-    """
+def build_player_season(data: dict, us_season: int) -> pd.DataFrame:
+    """Understat player season stats with canonical team names and season label."""
     players = data["us_players"].copy()
     if players.empty:
         return players
 
     canonicalize_teams(players, "team")
 
-    # primary_team = last team in the (potentially comma-separated) string
     players["primary_team"] = players["team"].apply(
         lambda t: str(t).split(",")[-1].strip() if pd.notna(t) else t
     )
 
-    # Reorder: put primary_team next to team
     cols = list(players.columns)
     team_idx = cols.index("team")
     cols.insert(team_idx + 1, cols.pop(cols.index("primary_team")))
-    return players[cols]
+    players = players[cols]
+
+    players["season"] = season_label(us_season)
+    return players
 
 
 # ---------------------------------------------------------------------------
@@ -368,45 +356,76 @@ def build_player_season(data: dict) -> pd.DataFrame:
 def main():
     ensure_dir(str(OUT))
 
-    print("=" * 55)
-    print("build_processed.py")
-    print(f"Season: Understat={US_SEASON}  ESPN={ESPN_SEASON}  WhoScored={WS_SEASON}")
-    print("=" * 55)
+    seasons = detect_seasons()
+    if not seasons:
+        sys.exit(1)
 
-    print("\n[1/7] Loading raw data...")
-    data = load_raw()
+    print("=" * 60)
+    print("build_processed.py  —  multi-season build")
+    print(f"Seasons found: {[season_label(s) for s in seasons]}")
+    print("=" * 60)
 
-    print("\n[2/7] Building match crossref...")
-    crossref = build_match_crossref(data)
+    all_crossref = []
+    all_shots    = []
+    all_events   = []
+    all_summary  = []
+    all_lineups  = []
+    all_players  = []
 
-    print("\n[3/7] Building shots...")
-    shots = build_shots(data, crossref)
+    for us_season in seasons:
+        lbl = season_label(us_season)
+        print(f"\n── {lbl} (year={us_season}) ──")
 
-    print("\n[4/7] Building events...")
-    events = build_events(data, crossref)
+        data = load_raw(us_season)
 
-    print("\n[5/7] Building match summary...")
-    match_summary = build_match_summary(data, crossref)
+        missing = [k for k, v in data.items() if v.empty]
+        if missing:
+            print(f"  Missing source files: {', '.join(missing)}")
 
-    print("\n[6/7] Building lineups...")
-    lineups = build_lineups(data, crossref)
+        if data["us_matches"].empty:
+            print(f"  Skipping {lbl} — no Understat matches file")
+            continue
 
-    print("\n[7/7] Building player season stats...")
-    player_season = build_player_season(data)
+        crossref = build_match_crossref(data, us_season)
+        all_crossref.append(crossref)
 
-    print("\nSaving to data/processed/ ...")
+        shots = build_shots(data, crossref, us_season)
+        if not shots.empty: all_shots.append(shots)
+
+        events = build_events(data, crossref, us_season)
+        if not events.empty: all_events.append(events)
+
+        summary = build_match_summary(data, crossref, us_season)
+        all_summary.append(summary)
+
+        lineups = build_lineups(data, crossref, us_season)
+        if not lineups.empty: all_lineups.append(lineups)
+
+        players = build_player_season(data, us_season)
+        if not players.empty: all_players.append(players)
+
+    # Concatenate all seasons and write to disk
+    print(f"\n{'='*60}")
+    print("Saving combined output to data/processed/ ...")
+
+    def safe_concat(frames: list) -> pd.DataFrame:
+        frames = [f for f in frames if f is not None and not f.empty]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     outputs = {
-        "match_crossref.csv": crossref,
-        "shots.csv":          shots,
-        "events.csv":         events,
-        "match_summary.csv":  match_summary,
-        "lineups.csv":        lineups,
-        "player_season.csv":  player_season,
+        "match_crossref.csv": safe_concat(all_crossref),
+        "shots.csv":          safe_concat(all_shots),
+        "events.csv":         safe_concat(all_events),
+        "match_summary.csv":  safe_concat(all_summary),
+        "lineups.csv":        safe_concat(all_lineups),
+        "player_season.csv":  safe_concat(all_players),
     }
+
     for filename, df in outputs.items():
         path = OUT / filename
         df.to_csv(path, index=False)
-        print(f"  ✓ {filename:<25} {len(df):>7} rows")
+        season_list = sorted(df["season"].unique()) if ("season" in df.columns and not df.empty) else []
+        print(f"  ✓ {filename:<25} {len(df):>8} rows   {season_list}")
 
     print("\n✓ Done. All files saved to data/processed/")
 

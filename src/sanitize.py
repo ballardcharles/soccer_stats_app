@@ -23,6 +23,8 @@ import pandas as pd
 # Add new entries here whenever a new team appears in any source.
 TEAM_NAME_MAP: dict[str, str] = {
     # ---- Canonical names (pass-through) ----
+    # These are the short-form names used in all processed output.
+    # Every source variant below maps to one of these.
     "Arsenal":           "Arsenal",
     "Aston Villa":       "Aston Villa",
     "Bournemouth":       "Bournemouth",
@@ -33,28 +35,57 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Crystal Palace":    "Crystal Palace",
     "Everton":           "Everton",
     "Fulham":            "Fulham",
+    "Ipswich":           "Ipswich",
     "Leeds":             "Leeds",
+    "Leicester":         "Leicester",
     "Liverpool":         "Liverpool",
+    "Luton":             "Luton",
     "Man City":          "Man City",
     "Man Utd":           "Man Utd",
     "Newcastle":         "Newcastle",
+    "Norwich":           "Norwich",
     "Nottingham Forest": "Nottingham Forest",
+    "Sheffield Utd":     "Sheffield Utd",
+    "Southampton":       "Southampton",
     "Sunderland":        "Sunderland",
     "Tottenham":         "Tottenham",
+    "Watford":           "Watford",
+    "West Brom":         "West Brom",
     "West Ham":          "West Ham",
     "Wolves":            "Wolves",
+
     # ---- Understat variants ----
-    "Manchester City":         "Man City",
-    "Manchester United":       "Man Utd",
-    "Newcastle United":        "Newcastle",
-    "Wolverhampton Wanderers": "Wolves",
+    "Manchester City":              "Man City",
+    "Manchester United":            "Man Utd",
+    "Newcastle United":             "Newcastle",
+    "Wolverhampton Wanderers":      "Wolves",
+    "Sheffield United":             "Sheffield Utd",
+    "Nottingham Forest":            "Nottingham Forest",
+    "Norwich City":                 "Norwich",
+    "Watford":                      "Watford",
+    "Luton Town":                   "Luton",
+    "West Bromwich Albion":         "West Brom",
+    "Ipswich Town":                 "Ipswich",
+    "Leicester City":               "Leicester",
+
     # ---- ESPN variants ----
-    "AFC Bournemouth":         "Bournemouth",
-    "Brighton & Hove Albion":  "Brighton",
-    "Leeds United":            "Leeds",
-    "Tottenham Hotspur":       "Tottenham",
-    "West Ham United":         "West Ham",
-    # ESPN uses long names for Man City/Utd too — already covered above
+    "AFC Bournemouth":              "Bournemouth",
+    "Brighton & Hove Albion":       "Brighton",
+    "Leeds United":                 "Leeds",
+    "Tottenham Hotspur":            "Tottenham",
+    "West Ham United":              "West Ham",
+    "Sheffield United":             "Sheffield Utd",   # also covers Understat
+    "Luton Town":                   "Luton",
+    "West Bromwich Albion":         "West Brom",
+    "Ipswich Town":                 "Ipswich",
+    "Leicester City":               "Leicester",
+    "Norwich City":                 "Norwich",
+
+    # ---- WhoScored variants (uses long-form names) ----
+    "Brighton and Hove Albion":     "Brighton",
+    "Wolverhampton":                "Wolves",
+    "Nott'm Forest":                "Nottingham Forest",
+    "Nottm Forest":                 "Nottingham Forest",
 }
 
 

@@ -2,38 +2,50 @@
 run_collection.py
 -----------------
 Master runner for all data collectors.
-Run this script weekly to keep all data up to date.
 
-Data collected:
-    Understat   — match xG, shot coordinates, player season xG/xA
-    ESPN        — schedule, match stats, lineups
-    WhoScored   — full match event streams (passes, tackles, pressures, etc.)
+Loops over every season in SEASONS and runs all three collectors for each.
+All collectors are incremental — they skip matches already on disk — so this
+script is safe to re-run at any time.  New matches are appended; nothing is
+overwritten.
 
-Season format note:
-    FBref uses "2526" (string, two-year format, e.g. 2025-26)
-    ESPN / WhoScored use "2025" (string, end-year or start-year)
-    Understat uses 2025 (int, season start year)
+First-time backfill across 5 seasons:
+    Understat   ~5-10 min  (fast, JSON scrape)
+    ESPN        ~10-20 min (API, rate-limited)
+    WhoScored   ~5-10 hrs  (full event stream per match, browser-based)
+
+Weekly update (current season only, ~5-10 new matches):
+    Typically 10-30 minutes total.
+
+To collect only the current season, comment out older entries in SEASONS.
 """
 
 from src.collectors.understat_scraper import pull_understat_data
-from src.collectors.espn_collector import pull_espn_data
+from src.collectors.espn_collector    import pull_espn_data
 from src.collectors.whoscored_collector import pull_whoscored_events
 from src.utils import ensure_dir
 
 # ---------------------------------------------------------------------------
-# Season config — update these each season
+# Season config
 # ---------------------------------------------------------------------------
+# Add a new entry here each season — nothing else needs to change.
+# Each integer is the Understat end-year (e.g. 2025 = the 2024/25 season).
+# ESPN and WhoScored use the same year as a string.
+#
+# To do a fast weekly update, you can temporarily comment out older seasons.
 
-ESPN_SEASON    = "2025"   # ESPN end-year format
-UNDERSTAT_YEAR = 2025     # Understat start year (int)
-WHOSCORED_SEASON = "2025" # WhoScored start year (string)
+SEASONS = [
+    2023,   # 2022/23
+    2024,   # 2023/24
+    2025,   # 2024/25
+    # 2026, # 2025/26  — uncomment when that season starts
+]
 
-LEAGUE_ESPN    = "ENG-Premier League"
-LEAGUE_WS      = "ENG-Premier League"
-LEAGUE_US      = "EPL"
+LEAGUE_ESPN = "ENG-Premier League"
+LEAGUE_WS   = "ENG-Premier League"
+LEAGUE_US   = "EPL"
 
 # ---------------------------------------------------------------------------
-# Ensure all output directories exist
+# Ensure output directories exist
 # ---------------------------------------------------------------------------
 
 ensure_dir("data/raw_understat")
@@ -47,24 +59,31 @@ ensure_dir("logs")
 
 if __name__ == "__main__":
 
-    # --- Understat ---
-    # Pulls: match list + player season xG/xA (one page load),
-    #        shot coordinates for each new completed match (incremental)
-    # Full season shot scrape: ~30-40 min first run, ~5 min weekly thereafter
-    pull_understat_data(
-        league=LEAGUE_US,
-        season=UNDERSTAT_YEAR,
-        include_shots=True,
-    )
+    for us_year in SEASONS:
+        espn_season = str(us_year)
+        ws_season   = str(us_year)
+        label       = f"{us_year - 1}/{str(us_year)[2:]}"
 
-    # --- ESPN ---
-    # Pulls: schedule, match stats, team lineups
-    pull_espn_data(season=ESPN_SEASON, league=LEAGUE_ESPN)
+        print(f"\n{'='*55}")
+        print(f"Season: {label}  (year={us_year})")
+        print(f"{'='*55}")
 
-    # --- WhoScored ---
-    # Pulls: full event stream for each match (passes, shots, tackles,
-    #        dribbles, pressures, clearances, carries)
-    # Note: headless=False is set inside the collector — a browser window
-    #       will open. This is intentional to avoid bot detection.
-    # First run is slow (~1-2 hrs for full season). Weekly runs are fast.
-    pull_whoscored_events(season=WHOSCORED_SEASON, league=LEAGUE_WS)
+        # --- Understat ---
+        # Pulls match list, player season xG/xA, and shot coordinates.
+        # Incremental: only fetches matches not already in the CSV.
+        pull_understat_data(
+            league=LEAGUE_US,
+            season=us_year,
+            include_shots=True,
+        )
+
+        # --- ESPN ---
+        # Pulls schedule, match stats, and team lineups.
+        # Incremental: skips games already present in the output files.
+        pull_espn_data(season=espn_season, league=LEAGUE_ESPN)
+
+        # --- WhoScored ---
+        # Pulls full event stream (passes, shots, tackles, etc.) per match.
+        # Incremental: skips matches already in the events CSV.
+        # A browser window will open — this is intentional to avoid bot detection.
+        pull_whoscored_events(season=ws_season, league=LEAGUE_WS)

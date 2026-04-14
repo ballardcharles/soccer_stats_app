@@ -160,14 +160,48 @@ def dark_fig_style(fig, *axes):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — VIEW SELECTOR
+# SIDEBAR — SEASON SELECTOR + VIEW SELECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 # The sidebar is always visible. Selecting a different view re-runs the script
 # from top to bottom — Streamlit's execution model means the entire script
 # re-executes on every user interaction, but cached data is reused.
+#
+# Season selector: reads the unique 'season' values from match_summary (the
+# most complete dataset).  Falls back to "All Seasons" if the column doesn't
+# exist yet (i.e. the user hasn't rebuilt processed data after this update).
+# Filtering is applied once here; every view below uses the pre-filtered dict S.
 
 st.sidebar.title("⚽ PL Analytics")
 st.sidebar.markdown("---")
+
+# Detect available seasons from the data
+_ms = S["match_summary"]
+if "season" in _ms.columns and not _ms.empty:
+    available_seasons = sorted(_ms["season"].dropna().unique(), reverse=True)
+else:
+    available_seasons = []
+
+if available_seasons:
+    sel_season = st.sidebar.selectbox(
+        "Season:",
+        available_seasons,
+        index=0,   # default to most recent
+    )
+else:
+    sel_season = None
+    st.sidebar.info("Season column not found — re-run `build_processed.py` to enable season filtering.")
+
+st.sidebar.markdown("---")
+
+# Apply season filter to every DataFrame.
+# S["shots"] etc. are the season-scoped versions used by all views below.
+# If sel_season is None (old data format), S is just D unchanged.
+def filter_season(df: pd.DataFrame) -> pd.DataFrame:
+    if sel_season is None or "season" not in df.columns or df.empty:
+        return df
+    return df[df["season"] == sel_season].copy()
+
+S = {k: filter_season(v) for k, v in D.items()}
 
 view = st.sidebar.selectbox("View:", [
     "🎯 Shot Maps",
@@ -196,7 +230,7 @@ st.sidebar.markdown("---")
 if view == "🎯 Shot Maps":
     st.title("🎯 Shot Maps")
 
-    shots = D["shots"]
+    shots = S["shots"]
     if shots.empty:
         st.warning("No shot data — run the collection pipeline.")
         st.stop()
@@ -418,7 +452,7 @@ if view == "🎯 Shot Maps":
 elif view == "🔥 Event Heatmaps":
     st.title("🔥 Event Heatmaps")
 
-    events = D["events"]
+    events = S["events"]
     if events.empty:
         st.warning("No event data — run the WhoScored collector.")
         st.stop()
@@ -574,7 +608,7 @@ elif view == "🔥 Event Heatmaps":
 elif view == "📊 Match Analysis":
     st.title("📊 Match Analysis")
 
-    ms = D["match_summary"]
+    ms = S["match_summary"]
     if ms.empty:
         st.warning("No match data available.")
         st.stop()
@@ -668,7 +702,7 @@ elif view == "📊 Match Analysis":
     # VerticalPitch (the pitch is rotated so the attacking end faces upward).
     # Dot colour: lime=goal, yellow=saved, red=everything else.
     # Dot size scales with xG so higher-quality chances are more visible.
-    shots = D["shots"]
+    shots = S["shots"]
     if not shots.empty and "match_date" in shots.columns:
         match_date_val = pd.to_datetime(row["match_date"]).date()
         match_shots = shots[
@@ -723,7 +757,7 @@ elif view == "📊 Match Analysis":
 elif view == "👤 Player Stats":
     st.title("👤 Player Season Stats")
 
-    ps = D["player_season"]
+    ps = S["player_season"]
     if ps.empty:
         st.warning("No player data — run the Understat collector.")
         st.stop()
@@ -858,7 +892,7 @@ elif view == "👤 Player Stats":
 elif view == "📈 xG Analysis":
     st.title("📈 Team xG Analysis")
 
-    ms = D["match_summary"]
+    ms = S["match_summary"]
     needed = {"home_team", "away_team", "home_xg", "away_xg", "home_goals", "away_goals"}
     if ms.empty or not needed.issubset(ms.columns):
         st.warning("Match summary data is incomplete — re-run `build_processed.py`.")

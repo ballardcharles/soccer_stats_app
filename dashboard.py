@@ -142,6 +142,18 @@ def match_label(row) -> str:
     return f"{d}  {row['home_team']} v {row['away_team']}"
 
 
+def safe_int(val, default=0) -> int:
+    """Convert val to int, returning default for NaN/None.
+
+    float('nan') is truthy in Python so `NaN or 0` still returns NaN.
+    This helper uses pd.isna() to catch it properly.
+    """
+    try:
+        return default if pd.isna(val) else int(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def dark_fig_style(fig, *axes):
     """Apply a consistent dark theme to a matplotlib figure and its axes.
 
@@ -631,7 +643,7 @@ elif view == "📊 Match Analysis":
 
     with home_col:
         st.markdown(f"### 🏠 {row['home_team']}")
-        st.metric("Goals", int(row.get("home_goals") or 0))
+        st.metric("Goals", safe_int(row.get("home_goals")))
         if "home_xg" in row:
             st.metric("xG", f"{row['home_xg']:.2f}")
         if "forecast_win" in row:
@@ -641,7 +653,7 @@ elif view == "📊 Match Analysis":
         # Raw HTML used here because Streamlit's st.metric doesn't support
         # centred large text for a score display.
         date_str = pd.to_datetime(row["match_date"]).strftime("%d %b %Y")
-        score = f"{int(row.get('home_goals') or 0)} – {int(row.get('away_goals') or 0)}"
+        score = f"{safe_int(row.get('home_goals'))} – {safe_int(row.get('away_goals'))}"
         st.markdown(
             f"<div style='text-align:center; padding-top:24px'>"
             f"<p style='color:#aaa; font-size:13px; margin-bottom:4px'>{date_str}</p>"
@@ -652,7 +664,7 @@ elif view == "📊 Match Analysis":
 
     with away_col:
         st.markdown(f"### ✈️ {row['away_team']}")
-        st.metric("Goals", int(row.get("away_goals") or 0))
+        st.metric("Goals", safe_int(row.get("away_goals")))
         if "away_xg" in row:
             st.metric("xG", f"{row['away_xg']:.2f}")
         if "forecast_loss" in row:

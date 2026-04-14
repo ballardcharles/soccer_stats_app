@@ -365,10 +365,9 @@ elif view == "🔥 Event Heatmaps":
     if sel_types:
         ev = ev[ev["type"].isin(sel_types)]
     if sel_period != "Full Match" and "period" in ev.columns:
-        # Cast to numeric to handle float/string dtypes from CSV round-trip
-        period_num = pd.to_numeric(ev["period"], errors="coerce")
-        target = 1 if sel_period == "1st Half" else 2
-        ev = ev[period_num == target]
+        # WhoScored stores period as "FirstHalf" / "SecondHalf" strings
+        target = "FirstHalf" if sel_period == "1st Half" else "SecondHalf"
+        ev = ev[ev["period"] == target]
 
     valid = ev.dropna(subset=["x", "y"])
     st.metric("Events plotted", len(valid))

@@ -175,7 +175,7 @@ st.sidebar.title("⚽ PL Analytics")
 st.sidebar.markdown("---")
 
 # Detect available seasons from the data
-_ms = S["match_summary"]
+_ms = D["match_summary"]
 if "season" in _ms.columns and not _ms.empty:
     available_seasons = sorted(_ms["season"].dropna().unique(), reverse=True)
 else:

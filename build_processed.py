@@ -56,13 +56,13 @@ OUT      = Path("data/processed")
 def season_label(us_year: int) -> str:
     """Convert an Understat year integer to a display label.
 
-    The Understat year represents the END calendar year of the season.
+    The Understat year represents the START calendar year of the season.
     Examples:
-        2025  ->  '2024/25'
-        2024  ->  '2023/24'
-        2023  ->  '2022/23'
+        2025  ->  '2025/26'
+        2024  ->  '2024/25'
+        2023  ->  '2023/24'
     """
-    return f"{us_year - 1}/{str(us_year)[2:]}"
+    return f"{us_year}/{str(us_year + 1)[2:]}"
 
 
 def detect_seasons() -> list[int]:

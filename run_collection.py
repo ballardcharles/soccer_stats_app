@@ -28,15 +28,15 @@ from src.utils import ensure_dir
 # Season config
 # ---------------------------------------------------------------------------
 # Add a new entry here each season — nothing else needs to change.
-# Each integer is the Understat end-year (e.g. 2025 = the 2024/25 season).
+# Each integer is the Understat start-year (e.g. 2025 = the 2025/26 season).
 # ESPN and WhoScored use the same year as a string.
 #
 # To do a fast weekly update, you can temporarily comment out older seasons.
 
 SEASONS = [
-    2023,   # 2022/23
-    2024,   # 2023/24
-    2025,   # 2024/25
+    2023,   # 2023/24
+    2024,   # 2024/25
+    2025,   # 2025/26
     # 2026, # 2025/26  — uncomment when that season starts
 ]
 

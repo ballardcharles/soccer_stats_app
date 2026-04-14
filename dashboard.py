@@ -364,17 +364,17 @@ elif view == "🔥 Event Heatmaps":
         ev = ev[ev_labels == sel_match]
     if sel_types:
         ev = ev[ev["type"].isin(sel_types)]
-    if sel_period == "1st Half" and "period" in ev.columns:
-        ev = ev[ev["period"] == 1]
-    elif sel_period == "2nd Half" and "period" in ev.columns:
-        ev = ev[ev["period"] == 2]
+    if sel_period != "Full Match" and "period" in ev.columns:
+        # Cast to numeric to handle float/string dtypes from CSV round-trip
+        period_num = pd.to_numeric(ev["period"], errors="coerce")
+        target = 1 if sel_period == "1st Half" else 2
+        ev = ev[period_num == target]
 
     valid = ev.dropna(subset=["x", "y"])
     st.metric("Events plotted", len(valid))
 
-    if len(valid) < 10:
-        st.warning(f"Not enough events ({len(valid)}) to generate a heatmap. "
-                   "Try broadening the filters.")
+    if valid.empty:
+        st.warning("No events match the selected filters.")
         st.stop()
 
     pitch = Pitch(
@@ -384,14 +384,27 @@ elif view == "🔥 Event Heatmaps":
     )
     fig, ax = pitch.draw(figsize=(12, 7))
 
-    pitch.kdeplot(
-        valid["x"].values,
-        (100 - valid["y"]).values,   # flip y for correct orientation
-        ax=ax,
-        cmap="hot", fill=True,
-        alpha=0.72, thresh=0.02, levels=15,
-        zorder=2,
-    )
+    if len(valid) >= 5:
+        pitch.kdeplot(
+            valid["x"].values,
+            (100 - valid["y"]).values,   # flip y for correct orientation
+            ax=ax,
+            cmap="hot", fill=True,
+            alpha=0.72, thresh=0.02, levels=15,
+            zorder=2,
+        )
+    else:
+        # Too few points for KDE — fall back to scatter
+        pitch.scatter(
+            valid["x"].values,
+            (100 - valid["y"]).values,
+            ax=ax, s=120, color="tomato",
+            edgecolors="white", linewidths=0.6,
+            zorder=3,
+        )
+        ax.text(50, 95, f"Only {len(valid)} events — showing scatter",
+               ha="center", fontsize=10, color="white",
+               bbox=dict(boxstyle="round", facecolor="#333", alpha=0.8, pad=0.4))
 
     type_str  = ", ".join(sel_types) if sel_types else "All Events"
     match_str = sel_match if sel_match != "All Matches" else "All Matches"

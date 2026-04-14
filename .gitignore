@@ -1,0 +1,38 @@
+# ── Virtual environment ──────────────────────────────────────────────────────
+soccer_env/
+
+# ── Data (raw and processed) ─────────────────────────────────────────────────
+# All data is either scraped (regenerable via collectors) or derived
+# (regenerable via build_processed.py). Too large to store in git.
+data/
+
+# ── Databases ────────────────────────────────────────────────────────────────
+understat.db
+understat.db-shm
+understat.db-wal
+
+# ── Logs & run artifacts ─────────────────────────────────────────────────────
+logs/
+*.log
+downloaded_files/
+
+# ── Archives ─────────────────────────────────────────────────────────────────
+src.zip
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Claude Code internals ────────────────────────────────────────────────────
+.claude/

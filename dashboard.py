@@ -153,10 +153,12 @@ if view == "🎯 Shot Maps":
         sel_player = st.selectbox("Player:", players)
 
     with f3:
-        if "match_date" in team_shots.columns:
+        if "match_date" in team_shots.columns and "opponent" in team_shots.columns:
+            # shots.csv has team/opponent, not home_team/away_team — build label from those
             match_opts = (
-                team_shots.dropna(subset=["match_date"])
-                .assign(label=lambda df: df.apply(match_label, axis=1))
+                team_shots.dropna(subset=["match_date", "opponent"])
+                .assign(label=lambda df:
+                    df["match_date"].dt.strftime("%d %b") + "  vs " + df["opponent"])
                 .drop_duplicates("label")
                 .sort_values("match_date")["label"]
                 .tolist()
@@ -170,7 +172,10 @@ if view == "🎯 Shot Maps":
     if sel_player != "All Players":
         filtered = filtered[filtered["player"] == sel_player]
     if sel_match != "All Matches":
-        filtered = filtered[filtered.apply(match_label, axis=1) == sel_match]
+        shot_labels = (
+            filtered["match_date"].dt.strftime("%d %b") + "  vs " + filtered["opponent"]
+        )
+        filtered = filtered[shot_labels == sel_match]
 
     if "result" in filtered.columns:
         all_results = sorted(filtered["result"].dropna().unique())

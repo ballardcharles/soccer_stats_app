@@ -631,7 +631,7 @@ elif view == "📊 Match Analysis":
 
     with home_col:
         st.markdown(f"### 🏠 {row['home_team']}")
-        st.metric("Goals", int(row.get("home_goals", 0)))
+        st.metric("Goals", int(row.get("home_goals") or 0))
         if "home_xg" in row:
             st.metric("xG", f"{row['home_xg']:.2f}")
         if "forecast_win" in row:
@@ -641,7 +641,7 @@ elif view == "📊 Match Analysis":
         # Raw HTML used here because Streamlit's st.metric doesn't support
         # centred large text for a score display.
         date_str = pd.to_datetime(row["match_date"]).strftime("%d %b %Y")
-        score = f"{int(row.get('home_goals',0))} – {int(row.get('away_goals',0))}"
+        score = f"{int(row.get('home_goals') or 0)} – {int(row.get('away_goals') or 0)}"
         st.markdown(
             f"<div style='text-align:center; padding-top:24px'>"
             f"<p style='color:#aaa; font-size:13px; margin-bottom:4px'>{date_str}</p>"
@@ -652,7 +652,7 @@ elif view == "📊 Match Analysis":
 
     with away_col:
         st.markdown(f"### ✈️ {row['away_team']}")
-        st.metric("Goals", int(row.get("away_goals", 0)))
+        st.metric("Goals", int(row.get("away_goals") or 0))
         if "away_xg" in row:
             st.metric("xG", f"{row['away_xg']:.2f}")
         if "forecast_loss" in row:

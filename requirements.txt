@@ -31,6 +31,10 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 lxml==6.0.2
 markdown-it-py==3.0.0
+matplotlib==3.10.8
+mplsoccer==1.6.1
+seaborn==0.13.2
+scipy==1.17.1
 MarkupSafe==3.0.3
 mdurl==0.1.2
 multidict==6.7.1

@@ -203,14 +203,13 @@ if view == "🎯 Shot Maps":
     # Coordinates are in WhoScored/opta [0,100]:
     #   x = 0 own goal → 100 attacking goal
     #   y = 0 top touchline → 100 bottom touchline
-    # VerticalPitch(half=True) shows x 50→100 (attacking half).
     # mplsoccer opta y is bottom→top so we flip: y_plot = 100 - y
-    pitch = VerticalPitch(
-        pitch_type="opta", half=True,
+    pitch = Pitch(
+        pitch_type="opta",
         pitch_color=PITCH_GREEN, line_color="white",
         line_zorder=2, linewidth=1.5,
     )
-    fig, ax = pitch.draw(figsize=(8, 7))
+    fig, ax = pitch.draw(figsize=(12, 7))
 
     if viz_type == "Shot Map":
         RESULT_STYLE = {
@@ -255,7 +254,7 @@ if view == "🎯 Shot Maps":
                 ax=ax, cmap="Reds", fill=True,
                 alpha=0.75, thresh=0.05, levels=10,
             )
-        ax.text(50, 52, f"Total Shots: {n_shots}", fontsize=11, ha="center",
+        ax.text(50, 5, f"Total Shots: {n_shots}", fontsize=11, ha="center",
                fontweight="bold",
                bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, pad=0.4))
 

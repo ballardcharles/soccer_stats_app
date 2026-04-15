@@ -207,11 +207,15 @@ def _get_team_grades(ms_df: pd.DataFrame):
 
 
 @st.cache_data
-def _get_player_grades(ps_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute player grades from player_season.csv, cached per DataFrame."""
+def _get_player_grades(
+    ps_df: pd.DataFrame,
+    ev_df: pd.DataFrame,
+    lu_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute player grades using Understat, WhoScored events, and ESPN lineups."""
     if ps_df.empty:
         return pd.DataFrame()
-    return compute_player_grades(ps_df)
+    return compute_player_grades(ps_df, events_df=ev_df, lineups_df=lu_df)
 
 
 @st.cache_data
@@ -1283,7 +1287,7 @@ elif view == "⭐ Player Grades":
         st.stop()
 
     with st.spinner("Computing player grades…"):
-        pg = _get_player_grades(ps)
+        pg = _get_player_grades(ps, D["events"], D["lineups"])
 
     if pg.empty:
         st.warning("Could not compute player grades.")
@@ -1319,29 +1323,35 @@ elif view == "⭐ Player Grades":
 
     # ── Grade table ───────────────────────────────────────────────────────────
     # Sorted by overall_grade descending; color map applied to grade columns.
+    # Show defensive columns for DEF/MID, saves for GK, offensive for FWD/MID
     disp_cols = [c for c in
-                 ["player", "team", "position", "games", "time",
+                 ["player", "team", "pos_group", "games", "time",
                   "goals", "assists",
                   "npxg_p90", "xa_p90", "kp_p90",
-                  "attack_grade", "creativity_grade", "overall_grade"]
+                  "tackles_won_p90", "interceptions_p90", "clearances_p90",
+                  "saves_p90",
+                  "attack_grade", "creativity_grade", "defensive_grade", "overall_grade"]
                  if c in pgf.columns]
 
     tbl = pgf[disp_cols].sort_values("overall_grade", ascending=False).copy()
 
-    # Round per-90 metrics and grade columns
+    # Round all numeric grade/metric columns for clean display
     for c in ["npxg_p90", "xa_p90", "kp_p90",
-              "attack_grade", "creativity_grade", "overall_grade"]:
+              "tackles_won_p90", "interceptions_p90", "clearances_p90", "saves_p90",
+              "attack_grade", "creativity_grade", "defensive_grade", "overall_grade"]:
         if c in tbl.columns:
             tbl[c] = tbl[c].round(2)
 
     st.dataframe(
         tbl.rename(columns={
-            "player": "Player", "team": "Team", "position": "Pos",
+            "player": "Player", "team": "Team", "pos_group": "Pos",
             "games": "Apps", "time": "Mins",
             "goals": "Goals", "assists": "Assists",
             "npxg_p90": "npxG/90", "xa_p90": "xA/90", "kp_p90": "KP/90",
+            "tackles_won_p90": "Tkl Won/90", "interceptions_p90": "Int/90",
+            "clearances_p90": "Clr/90", "saves_p90": "Saves/90",
             "attack_grade": "Attack", "creativity_grade": "Creativity",
-            "overall_grade": "Overall",
+            "defensive_grade": "Defense", "overall_grade": "Overall",
         }),
         use_container_width=True, hide_index=True, height=450,
     )
@@ -1371,30 +1381,34 @@ elif view == "⭐ Player Grades":
             st.pyplot(fig)
 
     with c2:
-        # ── Attack vs Creativity scatter ──────────────────────────────────────
-        # Each dot is a player.  Top players are labelled.
-        st.subheader("Attack vs Creativity")
-        if {"attack_grade", "creativity_grade"}.issubset(pgf.columns) and len(pgf) > 2:
+        # ── Attack vs Defense scatter ─────────────────────────────────────────
+        # Outfield players only (GKs have NaN attack_grade).
+        # Four quadrants: top-right = complete players, top-left = defensive
+        # specialists, bottom-right = pure attackers, bottom-left = fringe.
+        # Dashed lines mark the group average for each axis.
+        st.subheader("Attack vs Defense")
+        outfield = pgf[pgf["pos_group"] != "GK"].dropna(
+            subset=["attack_grade", "defensive_grade"]
+        )
+        if len(outfield) > 2:
             fig, ax = plt.subplots(figsize=(6, 5))
             sc = ax.scatter(
-                pgf["attack_grade"], pgf["creativity_grade"],
-                c=pgf["overall_grade"], cmap="RdYlGn",
+                outfield["attack_grade"], outfield["defensive_grade"],
+                c=outfield["overall_grade"], cmap="RdYlGn",
                 s=60, alpha=0.75, edgecolors="white", linewidths=0.4,
                 vmin=1, vmax=10,
             )
-            # League average reference lines
-            ax.axhline(pgf["creativity_grade"].mean(), color="white",
+            ax.axhline(outfield["defensive_grade"].mean(), color="white",
                        linestyle="--", alpha=0.3, lw=1)
-            ax.axvline(pgf["attack_grade"].mean(), color="white",
+            ax.axvline(outfield["attack_grade"].mean(), color="white",
                        linestyle="--", alpha=0.3, lw=1)
             ax.set_xlabel("Attack Grade")
-            ax.set_ylabel("Creativity Grade")
+            ax.set_ylabel("Defense Grade")
             ax.set_xlim(1, 10)
             ax.set_ylim(1, 10)
-            # Label top 8 by overall grade
-            for _, p in pgf.nlargest(8, "overall_grade").iterrows():
-                ax.annotate(p["player"].split()[-1],   # surname only
-                            (p["attack_grade"], p["creativity_grade"]),
+            for _, p in outfield.nlargest(8, "overall_grade").iterrows():
+                ax.annotate(p["player"].split()[-1],
+                            (p["attack_grade"], p["defensive_grade"]),
                             fontsize=7, color="white",
                             xytext=(4, 4), textcoords="offset points")
             plt.colorbar(sc, ax=ax, label="Overall Grade")

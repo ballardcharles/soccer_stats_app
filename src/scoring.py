@@ -445,89 +445,308 @@ def compute_rolling_grades(flat: pd.DataFrame, n: int = 5) -> pd.DataFrame:
 # 4.  Player season grades
 # ---------------------------------------------------------------------------
 
-def compute_player_grades(player_season: pd.DataFrame) -> pd.DataFrame:
+# Position group mapping: extract the primary position code from Understat's
+# multi-character position strings (e.g. "D S" → "D", "GK S" → "GK").
+_POS_GROUP = {
+    "GK":  "GK",
+    "D":   "DEF",
+    "D M": "MID",
+    "D F": "FWD",
+    "M":   "MID",
+    "F M": "MID",
+    "F":   "FWD",
+}
+
+def _pos_group(pos_str: str) -> str:
+    """Map an Understat position string to one of: GK / DEF / MID / FWD.
+
+    Understat encodes position as space-separated codes plus an optional
+    trailing 'S' for substitute (e.g. "D S", "F M S", "GK S").
+    We strip trailing 'S' and match against _POS_GROUP; default is 'MID'.
+    """
+    if pd.isna(pos_str):
+        return "MID"
+    # Remove trailing substitute flag and extra whitespace
+    clean = str(pos_str).replace(" S", "").strip()
+    return _POS_GROUP.get(clean, "MID")
+
+
+def _aggregate_defensive_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate WhoScored defensive actions per player × team × season.
+
+    Actions counted:
+      tackles          — total Tackle events
+      tackles_won      — Tackle events with outcome 'Successful'
+      interceptions    — Interception events
+      clearances       — Clearance events
+      ball_recoveries  — BallRecovery events
+      aerials          — Aerial events
+      aerials_won      — Aerial events with outcome 'Successful'
+
+    Returns
+    -------
+    pd.DataFrame  — one row per player × team × season.
+    """
+    # Only rows that are defensive action types
+    def_types = {"Tackle", "Interception", "Clearance", "BallRecovery", "Aerial"}
+    ev = events_df[events_df["type"].isin(def_types)].copy()
+
+    if ev.empty:
+        return pd.DataFrame(columns=[
+            "player", "team", "season",
+            "tackles", "tackles_won", "interceptions",
+            "clearances", "ball_recoveries", "aerials", "aerials_won",
+        ])
+
+    # Build boolean helper columns so groupby lambdas stay readable
+    ev["_tackle"]      = ev["type"] == "Tackle"
+    ev["_tackle_won"]  = (ev["type"] == "Tackle")  & (ev["outcome_type"] == "Successful")
+    ev["_intercept"]   = ev["type"] == "Interception"
+    ev["_clearance"]   = ev["type"] == "Clearance"
+    ev["_recovery"]    = ev["type"] == "BallRecovery"
+    ev["_aerial"]      = ev["type"] == "Aerial"
+    ev["_aerial_won"]  = (ev["type"] == "Aerial")  & (ev["outcome_type"] == "Successful")
+
+    agg = (
+        ev.groupby(["player", "team", "season"])
+        .agg(
+            tackles=("_tackle",     "sum"),
+            tackles_won=("_tackle_won",  "sum"),
+            interceptions=("_intercept",  "sum"),
+            clearances=("_clearance", "sum"),
+            ball_recoveries=("_recovery",  "sum"),
+            aerials=("_aerial",    "sum"),
+            aerials_won=("_aerial_won",  "sum"),
+        )
+        .reset_index()
+    )
+    return agg
+
+
+def _aggregate_gk_stats(lineups_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate goalkeeper saves / shots faced from lineups per player × season.
+
+    Returns
+    -------
+    pd.DataFrame — one row per GK player × team × season with columns:
+        player, team, season, total_saves, total_shots_faced, total_goals_conceded
+    """
+    gk = lineups_df[
+        lineups_df["position"].str.contains("Goalkeeper", na=False)
+    ].copy()
+
+    if gk.empty:
+        return pd.DataFrame(columns=[
+            "player", "team", "season",
+            "total_saves", "total_shots_faced", "total_goals_conceded",
+        ])
+
+    agg = (
+        gk.groupby(["player", "team", "season"])
+        .agg(
+            total_saves=("saves", "sum"),
+            total_shots_faced=("shots_faced", "sum"),
+            total_goals_conceded=("goals_conceded", "sum"),
+        )
+        .reset_index()
+    )
+    return agg
+
+
+def compute_player_grades(
+    player_season: pd.DataFrame,
+    events_df: pd.DataFrame | None = None,
+    lineups_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Compute 1-10 grades for players, one row per player × season.
 
     Only players with at least 90 minutes played are included (sufficient
     sample to compute meaningful per-90 metrics).
 
-    Per-90 metrics
-    --------------
+    Offensive metrics (from player_season / Understat)
+    ---------------------------------------------------
     npxg_p90     = npxg / (time / 90)   — non-penalty xG per 90 min
     xa_p90       = xa   / (time / 90)   — expected assists per 90 min
     kp_p90       = key_passes / (time / 90)
     xg_chain_p90 = xg_chain  / (time / 90)
 
-    Grade formulas (scaled within season)
-    --------------------------------------
+    Defensive metrics (from events_df / WhoScored)
+    -----------------------------------------------
+    tackles_won_p90    — successful tackles per 90
+    interceptions_p90  — interceptions per 90
+    clearances_p90     — clearances per 90
+    recoveries_p90     — ball recoveries per 90
+
+    Goalkeeper metrics (from lineups_df / ESPN)
+    -------------------------------------------
+    saves_p90  — saves per 90 minutes
+    Note: ESPN's shots_faced includes all attempts (on and off target) so
+    save_pct (saves/shots_faced) is NOT used — it produces unreliable values.
+    GK grade is based solely on saves_p90.
+
+    Grade formulas (all scaled within season × position group)
+    ----------------------------------------------------------
     attack_grade     = minmax(npxg_p90)
-    creativity_score = 0.6×xa_p90 + 0.4×kp_p90   (raw composite)
-    creativity_grade = minmax(creativity_score)
-    chain_scaled     = minmax(xg_chain_p90)
-    overall_grade    = minmax(0.5×attack_grade + 0.3×creativity_grade + 0.2×chain_scaled)
+    creativity_grade = minmax(0.6×xa_p90 + 0.4×kp_p90)
+    defensive_grade  = minmax(0.30×tackles_won + 0.25×interceptions
+                              + 0.25×clearances + 0.20×recoveries)   [DEF/MID/FWD]
+    gk_grade         = minmax(saves_p90)                              [GK only]
+    overall_grade:
+      GK:  minmax(saves_p90)
+      DEF: minmax(0.25×attack + 0.20×creativity + 0.55×defensive)
+      MID: minmax(0.35×attack + 0.35×creativity + 0.30×defensive)
+      FWD: minmax(0.50×attack + 0.35×creativity + 0.15×defensive)
 
     Parameters
     ----------
     player_season : pd.DataFrame
         Raw player_season.csv loaded as a DataFrame.
+    events_df : pd.DataFrame, optional
+        Full events.csv.  When supplied, adds defensive grades.
+    lineups_df : pd.DataFrame, optional
+        Full lineups.csv.  When supplied, adds GK-specific grades.
 
     Returns
     -------
     pd.DataFrame
-        Columns: player, player_id, team, season, position, games, time,
-                 goals, assists, npxg_p90, xa_p90, kp_p90, xg_chain_p90,
-                 attack_grade, creativity_grade, overall_grade
+        Columns: player, player_id, team, season, position, pos_group,
+                 games, time, goals, assists,
+                 npxg_p90, xa_p90, kp_p90, xg_chain_p90,
+                 [tackles_won_p90, interceptions_p90, clearances_p90, recoveries_p90,]
+                 [save_pct, saves_p90,]
+                 attack_grade, creativity_grade, defensive_grade,
+                 overall_grade
     """
     ps = player_season.copy()
 
-    # Minimum playing time filter
+    # ── Minimum playing time ──────────────────────────────────────────────────
     ps = ps[ps["time"] >= 90].copy()
 
-    # Minutes per 90 denominator
-    p90 = ps["time"] / 90.0
+    # ── Position group ────────────────────────────────────────────────────────
+    ps["pos_group"] = ps["position"].apply(_pos_group)
 
-    # Compute per-90 metrics
-    ps["npxg_p90"]     = ps["npxg"]      / p90
-    ps["xa_p90"]       = ps["xa"]        / p90
-    ps["kp_p90"]       = ps["key_passes"] / p90
-    ps["xg_chain_p90"] = ps["xg_chain"]  / p90
+    # ── Store p90 as a column BEFORE any merges ───────────────────────────────
+    # Merges reset the DataFrame index, which would misalign a standalone p90
+    # Series.  Storing it as "_p90" keeps it row-aligned through all joins.
+    ps["_p90"] = ps["time"] / 90.0
 
-    per90_cols = ["npxg_p90", "xa_p90", "kp_p90", "xg_chain_p90"]
+    # ── Offensive per-90 metrics ──────────────────────────────────────────────
+    ps["npxg_p90"]     = ps["npxg"]       / ps["_p90"]
+    ps["xa_p90"]       = ps["xa"]         / ps["_p90"]
+    ps["kp_p90"]       = ps["key_passes"] / ps["_p90"]
+    ps["xg_chain_p90"] = ps["xg_chain"]   / ps["_p90"]
 
-    # Median-impute per-90 metrics within season before scaling
+    # ── Defensive per-90 metrics (WhoScored events) ───────────────────────────
+    has_defensive = events_df is not None and not events_df.empty
+    if has_defensive:
+        def_agg = _aggregate_defensive_events(events_df)
+
+        # Join defensive action totals onto player_season on player+team+season.
+        # ~85% of players match by exact name; the rest get NaN (median-imputed).
+        ps = ps.merge(
+            def_agg[["player", "team", "season",
+                      "tackles_won", "interceptions", "clearances", "ball_recoveries"]],
+            on=["player", "team", "season"],
+            how="left",
+        )
+
+        # Scale totals to per-90 rates using the column (index-safe after merge)
+        ps["tackles_won_p90"]   = ps["tackles_won"]     / ps["_p90"]
+        ps["interceptions_p90"] = ps["interceptions"]   / ps["_p90"]
+        ps["clearances_p90"]    = ps["clearances"]      / ps["_p90"]
+        ps["recoveries_p90"]    = ps["ball_recoveries"] / ps["_p90"]
+    else:
+        for col in ["tackles_won_p90", "interceptions_p90",
+                    "clearances_p90", "recoveries_p90"]:
+            ps[col] = np.nan
+
+    # ── Goalkeeper stats (ESPN lineups) ───────────────────────────────────────
+    # Note: ESPN's shots_faced includes all attempts (on + off target), so
+    # saves/shots_faced does not give a meaningful save percentage.
+    # We use saves_p90 only.
+    has_gk = lineups_df is not None and not lineups_df.empty
+    if has_gk:
+        gk_agg = _aggregate_gk_stats(lineups_df)
+        ps = ps.merge(
+            gk_agg[["player", "team", "season", "total_saves"]],
+            on=["player", "team", "season"],
+            how="left",
+        )
+        ps["saves_p90"] = ps["total_saves"] / ps["_p90"]
+    else:
+        ps["saves_p90"] = np.nan
+
+    # ── Grade computation — scaled within season × position group ─────────────
+    def_p90_cols = ["tackles_won_p90", "interceptions_p90",
+                    "clearances_p90", "recoveries_p90"]
+    off_p90_cols = ["npxg_p90", "xa_p90", "kp_p90", "xg_chain_p90"]
+    gk_stat_cols = ["saves_p90"]
+
     grade_parts = []
 
-    for season, grp in ps.groupby("season"):
+    for (season, pos_group), grp in ps.groupby(["season", "pos_group"]):
         g = grp.copy()
-        g = _impute_medians(g, per90_cols)
 
-        # Scale individual metrics to [1,10]
-        g["attack_grade"]     = _minmax_scale(g["npxg_p90"])
+        # Impute missing values with within-group median before scaling
+        g = _impute_medians(g, off_p90_cols + def_p90_cols + gk_stat_cols)
 
-        creativity_raw        = 0.6 * g["xa_p90"] + 0.4 * g["kp_p90"]
-        g["creativity_grade"] = _minmax_scale(creativity_raw)
+        if pos_group == "GK":
+            # ── Goalkeeper grade — saves per 90 only ─────────────────────────
+            # ESPN shots_faced includes off-target attempts so save% is not
+            # reliable; saves_p90 is used as the sole GK performance metric.
+            g["defensive_grade"] = _minmax_scale(g["saves_p90"])
+            g["attack_grade"]    = pd.Series(np.nan, index=g.index)
+            g["creativity_grade"]= pd.Series(np.nan, index=g.index)
+            g["overall_grade"]   = g["defensive_grade"]
 
-        chain_scaled          = _minmax_scale(g["xg_chain_p90"])
+        else:
+            # ── Outfield: attack & creativity grades ─────────────────────────
+            g["attack_grade"]  = _minmax_scale(g["npxg_p90"])
 
-        # Overall: re-scale the weighted combination back to [1,10]
-        overall_raw           = (
-            0.5 * g["attack_grade"]
-            + 0.3 * g["creativity_grade"]
-            + 0.2 * chain_scaled
-        )
-        g["overall_grade"]    = _minmax_scale(overall_raw)
+            creativity_raw     = 0.6 * g["xa_p90"] + 0.4 * g["kp_p90"]
+            g["creativity_grade"] = _minmax_scale(creativity_raw)
+
+            # ── Outfield: defensive grade ─────────────────────────────────────
+            # Weights are the same across positions; the scaling within
+            # position group already accounts for the fact that defenders
+            # accumulate more clearances than forwards.
+            def_raw = (
+                0.30 * _minmax_scale(g["tackles_won_p90"])
+                + 0.25 * _minmax_scale(g["interceptions_p90"])
+                + 0.25 * _minmax_scale(g["clearances_p90"])
+                + 0.20 * _minmax_scale(g["recoveries_p90"])
+            )
+            g["defensive_grade"] = _minmax_scale(def_raw)
+
+            # ── Overall grade — position-adjusted weights ─────────────────────
+            # Defenders: defensive contributions weighted most heavily
+            # Midfielders: balanced across all three dimensions
+            # Forwards: attacking output weighted most heavily
+            weights = {
+                "DEF": (0.25, 0.20, 0.55),
+                "MID": (0.35, 0.35, 0.30),
+                "FWD": (0.50, 0.35, 0.15),
+            }.get(pos_group, (0.35, 0.35, 0.30))
+
+            overall_raw = (
+                weights[0] * g["attack_grade"]
+                + weights[1] * g["creativity_grade"]
+                + weights[2] * g["defensive_grade"]
+            )
+            g["overall_grade"] = _minmax_scale(overall_raw)
 
         grade_parts.append(g)
 
     result = pd.concat(grade_parts, ignore_index=True)
 
-    # Return only the specified output columns
+    # ── Output columns ────────────────────────────────────────────────────────
     out_cols = [
-        "player", "player_id", "team", "season", "position",
+        "player", "player_id", "team", "season", "position", "pos_group",
         "games", "time", "goals", "assists",
         "npxg_p90", "xa_p90", "kp_p90", "xg_chain_p90",
-        "attack_grade", "creativity_grade", "overall_grade",
+        "tackles_won_p90", "interceptions_p90", "clearances_p90", "recoveries_p90",
+        "saves_p90",
+        "attack_grade", "creativity_grade", "defensive_grade", "overall_grade",
     ]
-    # Keep only columns that actually exist (graceful degradation)
     out_cols = [c for c in out_cols if c in result.columns]
     return result[out_cols].reset_index(drop=True)

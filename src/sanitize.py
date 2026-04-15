@@ -86,6 +86,7 @@ TEAM_NAME_MAP: dict[str, str] = {
     "Wolverhampton":                "Wolves",
     "Nott'm Forest":                "Nottingham Forest",
     "Nottm Forest":                 "Nottingham Forest",
+    "Sheff Utd":                    "Sheffield Utd",
 }
 
 

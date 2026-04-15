@@ -282,8 +282,13 @@ def build_match_summary(data: dict, crossref: pd.DataFrame, us_season: int) -> p
     home = espn_stats[espn_stats["is_home"] == True].copy()
     away = espn_stats[espn_stats["is_home"] == False].copy()
 
-    stat_cols = [c for c in espn_stats.columns
-                 if c not in ("game", "is_home", "venue", "espn_game_id")]
+    # Exclude columns that would collide with crossref columns after the
+    # home_/away_ prefix rename. 'team' becomes 'home_team'/'away_team'
+    # which already exist in summary (from the crossref spine), causing
+    # pandas to add _x/_y suffixes and breaking downstream lookups.
+    EXCLUDE = {"game", "is_home", "venue", "espn_game_id", "team",
+               "home_team", "away_team"}
+    stat_cols = [c for c in espn_stats.columns if c not in EXCLUDE]
 
     home_wide = (home[["espn_game_id", "venue"] + stat_cols]
                  .rename(columns={c: f"home_{c}" for c in stat_cols}))
@@ -292,6 +297,12 @@ def build_match_summary(data: dict, crossref: pd.DataFrame, us_season: int) -> p
 
     espn_wide = home_wide.merge(away_wide, on="espn_game_id", how="outer")
     summary   = summary.merge(espn_wide, on="espn_game_id", how="left")
+
+    # If any suffix columns snuck through from a previous build, clean them up
+    for col in ("home_team", "away_team"):
+        if f"{col}_x" in summary.columns:
+            summary[col] = summary[f"{col}_x"]
+            summary = summary.drop(columns=[f"{col}_x", f"{col}_y"], errors="ignore")
 
     return summary
 

@@ -35,9 +35,9 @@ from src.utils import ensure_dir
 
 SEASONS = [
     2023,   # 2023/24
-    2024,   # 2024/25
-    2025,   # 2025/26
-    # 2026, # 2025/26  — uncomment when that season starts
+    #2024,   # 2024/25
+   #2025,   # 2025/26
+    # 2026, # 2026/27  — uncomment when that season starts
 ]
 
 LEAGUE_ESPN = "ENG-Premier League"

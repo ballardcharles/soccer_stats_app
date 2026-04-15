@@ -16,14 +16,30 @@ Views available:
 """
 
 import io
+import sys
 import warnings
 
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 import streamlit as st
 from matplotlib.lines import Line2D
 from mplsoccer import Pitch, VerticalPitch
+
+# Local modules
+sys.path.insert(0, "src")
+from scoring import (
+    flatten_match_summary,
+    compute_season_grades,
+    compute_rolling_grades,
+    compute_player_grades,
+)
+from predictor import (
+    build_poisson_model,
+    get_upcoming_fixtures,
+    predict_fixture,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -81,12 +97,13 @@ def load_data() -> dict[str, pd.DataFrame]:
     shots         = safe_read("shots.csv")         # Understat shot-level data
     events        = safe_read("events.csv")         # WhoScored full event stream
     match_summary = safe_read("match_summary.csv")  # One row per match (xG, goals, forecasts)
+    match_crossref = safe_read("match_crossref.csv") # All fixtures incl. upcoming (NaN goals)
     player_season = safe_read("player_season.csv")  # Understat player season totals
     lineups       = safe_read("lineups.csv")         # ESPN lineup data (unused in current views)
 
     # Parse match_date to a proper datetime once at load time.
     # errors="coerce" turns unparseable values into NaT rather than crashing.
-    for df in (shots, events, match_summary, lineups):
+    for df in (shots, events, match_summary, lineups, match_crossref):
         if "match_date" in df.columns:
             df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
 
@@ -94,6 +111,7 @@ def load_data() -> dict[str, pd.DataFrame]:
         shots=shots,
         events=events,
         match_summary=match_summary,
+        match_crossref=match_crossref,
         player_season=player_season,
         lineups=lineups,
     )
@@ -171,6 +189,43 @@ def dark_fig_style(fig, *axes):
             ax.set_title(ax.get_title(), color="white")
 
 
+# ---------------------------------------------------------------------------
+# Cached grade / predictor helpers
+# (defined here — before the view blocks — so they are always reachable
+#  regardless of which view is selected)
+# ---------------------------------------------------------------------------
+
+@st.cache_data
+def _get_team_grades(ms_df: pd.DataFrame):
+    """Flatten match_summary and return (season_grades, rolling_grades) DataFrames."""
+    if ms_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    flat    = flatten_match_summary(ms_df)
+    season  = compute_season_grades(flat)
+    rolling = compute_rolling_grades(flat, n=5)
+    return season, rolling
+
+
+@st.cache_data
+def _get_player_grades(ps_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute player grades from player_season.csv, cached per DataFrame."""
+    if ps_df.empty:
+        return pd.DataFrame()
+    return compute_player_grades(ps_df)
+
+
+@st.cache_data
+def _get_poisson_model(crossref_df: pd.DataFrame) -> dict:
+    """Build Poisson model from full crossref (all seasons), cached."""
+    return build_poisson_model(crossref_df, n_recent=10)
+
+
+@st.cache_data
+def _get_upcoming(crossref_df: pd.DataFrame) -> pd.DataFrame:
+    """Return upcoming (unplayed) fixtures from crossref, cached."""
+    return get_upcoming_fixtures(crossref_df)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR — SEASON SELECTOR + VIEW SELECTOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -221,6 +276,9 @@ view = st.sidebar.selectbox("View:", [
     "📊 Match Analysis",
     "👤 Player Stats",
     "📈 xG Analysis",
+    "🏅 Team Grades",
+    "⭐ Player Grades",
+    "🔮 Match Predictor",
 ])
 
 st.sidebar.markdown("---")
@@ -1024,6 +1082,503 @@ elif view == "📈 xG Analysis":
     dark_fig_style(fig, ax)
     plt.tight_layout()
     st.pyplot(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🏅  TEAM GRADES
+# ══════════════════════════════════════════════════════════════════════════════
+# Grades are computed from match_summary.csv (ESPN + Understat metrics).
+# Each sub-grade is scaled 1-10 relative to the season's competition:
+#   Attack  — xG, goals, shots on target %, xG per shot
+#   Defense — xGA (inverted), goals conceded (inverted), saves, interceptions
+#   Style   — possession %, pass accuracy, tackle success %
+#   Overall — Attack 40% + Defense 40% + Style 20%
+#
+# "Season Grade" = season-long average.
+# "Rolling Grade" = form going into each match (trailing 5-match window).
+
+elif view == "🏅 Team Grades":
+    st.title("🏅 Team Grades")
+
+    ms = D["match_summary"]   # Use full dataset (all seasons); filter below
+    if ms.empty:
+        st.warning("No match summary data — run `build_processed.py`.")
+        st.stop()
+
+    with st.spinner("Computing grades…"):
+        season_grades, rolling_grades = _get_team_grades(ms)
+
+    if season_grades.empty:
+        st.warning("Could not compute grades — check match_summary.csv.")
+        st.stop()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    f1, f2 = st.columns(2)
+    with f1:
+        # Season filter scoped to grades data (may span multiple seasons)
+        avail_seasons = sorted(season_grades["season"].dropna().unique(), reverse=True)
+        sel_gs = st.selectbox("Season:", avail_seasons, key="gs_season")
+    with f2:
+        # Team selector filtered to the chosen season
+        season_teams = sorted(
+            season_grades[season_grades["season"] == sel_gs]["team"].dropna().unique()
+        )
+        sel_gt = st.selectbox("Team:", season_teams, key="gs_team")
+
+    # ── Season grade card for selected team ───────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"{sel_gt} — Season Grades ({sel_gs})")
+
+    team_row = season_grades[
+        (season_grades["season"] == sel_gs) & (season_grades["team"] == sel_gt)
+    ]
+
+    if not team_row.empty:
+        r = team_row.iloc[0]
+
+        # Four metric cards: attack / defense / style / overall
+        # Color helper: red ≤ 4, amber 4-6, green ≥ 7
+        def _grade_color(g):
+            if g >= 7:   return "#00c853"   # green
+            if g >= 4.5: return "#ffd600"   # amber
+            return "#ff1744"                # red
+
+        c1, c2, c3, c4 = st.columns(4)
+        for col, label, key in [
+            (c1, "⚔️ Attack",   "attack_grade"),
+            (c2, "🛡️ Defense",  "defense_grade"),
+            (c3, "🎨 Style",    "style_grade"),
+            (c4, "⭐ Overall",  "overall_grade"),
+        ]:
+            val = round(float(r[key]), 1)
+            color = _grade_color(val)
+            col.markdown(
+                f"<div style='background:#1e1e1e;border-left:4px solid {color};"
+                f"padding:14px 18px;border-radius:6px;'>"
+                f"<div style='font-size:13px;color:#aaa;'>{label}</div>"
+                f"<div style='font-size:32px;font-weight:700;color:{color};'>{val:.1f}</div>"
+                f"<div style='font-size:11px;color:#666;'>/ 10.0</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Record summary ────────────────────────────────────────────────────
+        st.markdown("")
+        rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+        rc1.metric("Matches",  int(r["matches_played"]))
+        rc2.metric("Wins",     int(r["wins"]))
+        rc3.metric("Draws",    int(r["draws"]))
+        rc4.metric("Losses",   int(r["losses"]))
+        rc5.metric("Avg Pts",  f"{r['avg_points']:.2f}")
+
+    # ── Rolling form chart (Overall grade, last 10+ GWs) ──────────────────────
+    st.markdown("---")
+    st.subheader(f"Rolling Form — {sel_gt} ({sel_gs})")
+
+    # Filter rolling grades to selected team + season
+    team_rolling = rolling_grades[
+        (rolling_grades["season"] == sel_gs) & (rolling_grades["team"] == sel_gt)
+    ].copy()
+
+    if not team_rolling.empty and "roll_overall_grade" in team_rolling.columns:
+        # Sort by match date for a left-to-right timeline
+        team_rolling = team_rolling.sort_values("match_date").reset_index(drop=True)
+        team_rolling["gw"] = range(1, len(team_rolling) + 1)   # gameweek number
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+
+        # Plot the four sub-grade lines
+        grade_lines = [
+            ("roll_overall_grade",  "⭐ Overall",  "#ffffff", 2.5),
+            ("roll_attack_grade",   "⚔️ Attack",   "#00ff85", 1.5),
+            ("roll_defense_grade",  "🛡️ Defense",  "#4da6ff", 1.5),
+            ("roll_style_grade",    "🎨 Style",    "#ffd700", 1.2),
+        ]
+        for col, lbl, color, lw in grade_lines:
+            if col in team_rolling.columns:
+                ax.plot(team_rolling["gw"], team_rolling[col],
+                        label=lbl, color=color, linewidth=lw, marker="o",
+                        markersize=3, alpha=0.9)
+
+        # Shade background green (good form) / red (poor form) zones
+        ax.axhspan(7, 10, alpha=0.06, color="#00c853")
+        ax.axhspan(1,  4, alpha=0.06, color="#ff1744")
+        ax.axhline(5.5, color="white", linewidth=0.5, linestyle="--", alpha=0.3)
+
+        ax.set_xlim(1, len(team_rolling))
+        ax.set_ylim(1, 10)
+        ax.set_xlabel("Gameweek", color="white")
+        ax.set_ylabel("Grade (1–10)", color="white")
+        ax.set_title(
+            f"Rolling 5-match form — {sel_gt}",
+            color="white", fontsize=12
+        )
+        ax.legend(facecolor="#1a1a1a", labelcolor="white", fontsize=9,
+                  loc="upper left")
+        ax.grid(alpha=0.2)
+
+        # Annotate W/D/L results above the x-axis
+        result_colors = {"W": "#00c853", "D": "#ffd700", "L": "#ff1744"}
+        for _, row in team_rolling.iterrows():
+            res = row.get("result", "")
+            if res in result_colors:
+                ax.text(row["gw"], 1.15, res, ha="center", va="bottom",
+                        fontsize=7, color=result_colors[res], fontweight="bold")
+
+        dark_fig_style(fig, ax)
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("Not enough rolling data for this team / season.")
+
+    # ── All-teams season grade table ──────────────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"All Teams — {sel_gs}")
+
+    season_tbl = season_grades[season_grades["season"] == sel_gs].copy()
+    season_tbl = season_tbl.sort_values("overall_grade", ascending=False).reset_index(drop=True)
+
+    # Display columns
+    disp = ["team", "matches_played", "wins", "draws", "losses",
+            "avg_points", "avg_xg", "avg_xga",
+            "attack_grade", "defense_grade", "style_grade", "overall_grade"]
+    disp = [c for c in disp if c in season_tbl.columns]
+
+    # Round float columns for cleaner display
+    for c in ["avg_points", "avg_xg", "avg_xga",
+              "attack_grade", "defense_grade", "style_grade", "overall_grade"]:
+        if c in season_tbl.columns:
+            season_tbl[c] = season_tbl[c].round(1)
+
+    st.dataframe(
+        season_tbl[disp].rename(columns={
+            "team": "Team", "matches_played": "MP", "wins": "W",
+            "draws": "D", "losses": "L", "avg_points": "Avg Pts",
+            "avg_xg": "Avg xGF", "avg_xga": "Avg xGA",
+            "attack_grade": "Attack", "defense_grade": "Defense",
+            "style_grade": "Style", "overall_grade": "Overall",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⭐  PLAYER GRADES
+# ══════════════════════════════════════════════════════════════════════════════
+# Grades are derived from player_season.csv (Understat per-season xG/xA data).
+# Scaled 1-10 within season so grades reflect quality relative to same-season peers.
+#
+#   Attack grade     — npxG per 90 min (non-penalty xG)
+#   Creativity grade — xA per 90 (60%) + key passes per 90 (40%)
+#   Overall grade    — Attack 50% + Creativity 30% + xG Chain 20%
+#
+# Only players with ≥ 90 minutes played are included.
+
+elif view == "⭐ Player Grades":
+    st.title("⭐ Player Grades")
+
+    ps = D["player_season"]
+    if ps.empty:
+        st.warning("No player data — run the Understat collector.")
+        st.stop()
+
+    with st.spinner("Computing player grades…"):
+        pg = _get_player_grades(ps)
+
+    if pg.empty:
+        st.warning("Could not compute player grades.")
+        st.stop()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        avail_seasons = sorted(pg["season"].dropna().unique(), reverse=True)
+        sel_pgs = st.selectbox("Season:", avail_seasons, key="pg_season")
+    with f2:
+        teams_in_season = ["All Teams"] + sorted(
+            pg[pg["season"] == sel_pgs]["team"].dropna().unique()
+        )
+        sel_pgt = st.selectbox("Team:", teams_in_season, key="pg_team")
+    with f3:
+        positions = ["All Positions"] + sorted(
+            pg[pg["season"] == sel_pgs]["position"].dropna().unique()
+        ) if "position" in pg.columns else ["All Positions"]
+        sel_pgp = st.selectbox("Position:", positions, key="pg_pos")
+    with f4:
+        min_mins = st.slider("Min. Minutes:", 90, 2000, 450, step=90, key="pg_mins")
+
+    # Apply filters
+    pgf = pg[pg["season"] == sel_pgs].copy()
+    if sel_pgt != "All Teams":
+        pgf = pgf[pgf["team"] == sel_pgt]
+    if sel_pgp != "All Positions" and "position" in pgf.columns:
+        pgf = pgf[pgf["position"] == sel_pgp]
+    pgf = pgf[pgf["time"] >= min_mins]
+
+    st.metric("Players shown", len(pgf))
+
+    # ── Grade table ───────────────────────────────────────────────────────────
+    # Sorted by overall_grade descending; color map applied to grade columns.
+    disp_cols = [c for c in
+                 ["player", "team", "position", "games", "time",
+                  "goals", "assists",
+                  "npxg_p90", "xa_p90", "kp_p90",
+                  "attack_grade", "creativity_grade", "overall_grade"]
+                 if c in pgf.columns]
+
+    tbl = pgf[disp_cols].sort_values("overall_grade", ascending=False).copy()
+
+    # Round per-90 metrics and grade columns
+    for c in ["npxg_p90", "xa_p90", "kp_p90",
+              "attack_grade", "creativity_grade", "overall_grade"]:
+        if c in tbl.columns:
+            tbl[c] = tbl[c].round(2)
+
+    st.dataframe(
+        tbl.rename(columns={
+            "player": "Player", "team": "Team", "position": "Pos",
+            "games": "Apps", "time": "Mins",
+            "goals": "Goals", "assists": "Assists",
+            "npxg_p90": "npxG/90", "xa_p90": "xA/90", "kp_p90": "KP/90",
+            "attack_grade": "Attack", "creativity_grade": "Creativity",
+            "overall_grade": "Overall",
+        }),
+        use_container_width=True, hide_index=True, height=450,
+    )
+
+    st.markdown("---")
+
+    # ── Top 15 by overall grade (bar chart) ───────────────────────────────────
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Top 15 by Overall Grade")
+        top15 = pgf.nlargest(15, "overall_grade")
+        if not top15.empty:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            colors_bar = [
+                "#00c853" if g >= 7 else ("#ffd600" if g >= 4.5 else "#ff1744")
+                for g in top15["overall_grade"]
+            ]
+            ax.barh(top15["player"], top15["overall_grade"], color=colors_bar, alpha=0.9)
+            ax.set_xlabel("Overall Grade (1–10)")
+            ax.set_xlim(1, 10)
+            ax.invert_yaxis()
+            ax.axvline(5.5, color="white", linestyle="--", alpha=0.3, lw=1)
+            ax.grid(axis="x", alpha=0.25)
+            dark_fig_style(fig, ax)
+            plt.tight_layout()
+            st.pyplot(fig)
+
+    with c2:
+        # ── Attack vs Creativity scatter ──────────────────────────────────────
+        # Each dot is a player.  Top players are labelled.
+        st.subheader("Attack vs Creativity")
+        if {"attack_grade", "creativity_grade"}.issubset(pgf.columns) and len(pgf) > 2:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            sc = ax.scatter(
+                pgf["attack_grade"], pgf["creativity_grade"],
+                c=pgf["overall_grade"], cmap="RdYlGn",
+                s=60, alpha=0.75, edgecolors="white", linewidths=0.4,
+                vmin=1, vmax=10,
+            )
+            # League average reference lines
+            ax.axhline(pgf["creativity_grade"].mean(), color="white",
+                       linestyle="--", alpha=0.3, lw=1)
+            ax.axvline(pgf["attack_grade"].mean(), color="white",
+                       linestyle="--", alpha=0.3, lw=1)
+            ax.set_xlabel("Attack Grade")
+            ax.set_ylabel("Creativity Grade")
+            ax.set_xlim(1, 10)
+            ax.set_ylim(1, 10)
+            # Label top 8 by overall grade
+            for _, p in pgf.nlargest(8, "overall_grade").iterrows():
+                ax.annotate(p["player"].split()[-1],   # surname only
+                            (p["attack_grade"], p["creativity_grade"]),
+                            fontsize=7, color="white",
+                            xytext=(4, 4), textcoords="offset points")
+            plt.colorbar(sc, ax=ax, label="Overall Grade")
+            ax.grid(alpha=0.2)
+            dark_fig_style(fig, ax)
+            plt.tight_layout()
+            st.pyplot(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔮  MATCH PREDICTOR
+# ══════════════════════════════════════════════════════════════════════════════
+# Uses a Poisson goals model (Dixon-Coles style) to predict W/D/L probabilities
+# for any upcoming fixture.
+#
+# Model inputs (from match_crossref.csv):
+#   - Each team's attack rating = avg xG scored / league avg, last 10 matches
+#   - Each team's defense rating = avg xGA / league avg, last 10 matches
+#   - Home advantage = ratio of total home xG to away xG
+#   - Ratings shrunk toward 1.0 (league avg) via Bayesian prior
+#
+# Lambda (expected goals):
+#   home = league_avg × attack(home) × defense(away) × home_advantage
+#   away = league_avg × attack(away) × defense(home)
+#
+# W/D/L probabilities are summed from a 7×7 Poisson scoreline grid.
+
+elif view == "🔮 Match Predictor":
+    st.title("🔮 Match Predictor")
+    st.caption(
+        "Poisson model using each team's last 10 matches (xG-based attack/defense ratings). "
+        "Grades reflect form going into the fixture."
+    )
+
+    crossref = D["match_crossref"]
+    if crossref.empty:
+        st.warning("No crossref data — run `build_processed.py`.")
+        st.stop()
+
+    with st.spinner("Building model…"):
+        poisson_model = _get_poisson_model(crossref)
+        upcoming      = _get_upcoming(crossref)
+        season_grades, _ = _get_team_grades(D["match_summary"])
+
+    if upcoming.empty:
+        st.info("No upcoming fixtures found in the data. "
+                "Re-run the ESPN collector to refresh the schedule.")
+        st.stop()
+
+    # ── Fixture selector ─────────────────────────────────────────────────────
+    # Show all upcoming fixtures in a dropdown, grouped implicitly by date.
+    fixture_labels = upcoming["fixture_label"].tolist()
+    sel_fixture_lbl = st.selectbox("Select Fixture:", fixture_labels)
+
+    fixture_row = upcoming[upcoming["fixture_label"] == sel_fixture_lbl].iloc[0]
+    home_team = fixture_row["home_team"]
+    away_team = fixture_row["away_team"]
+    match_date_str = pd.to_datetime(fixture_row["match_date"]).strftime("%A %-d %B %Y")
+
+    st.markdown(f"### {home_team}  vs  {away_team}")
+    st.caption(f"📅 {match_date_str}")
+    st.markdown("---")
+
+    # ── Run prediction ────────────────────────────────────────────────────────
+    pred = predict_fixture(home_team, away_team, poisson_model)
+
+    # W / D / L probability cards
+    p1, p2, p3 = st.columns(3)
+    for col, label, prob, color in [
+        (p1, f"🏠 {home_team} Win", pred["home_win_prob"], "#00c853"),
+        (p2, "🤝 Draw",             pred["draw_prob"],      "#ffd600"),
+        (p3, f"✈️ {away_team} Win", pred["away_win_prob"],  "#4da6ff"),
+    ]:
+        col.markdown(
+            f"<div style='background:#1e1e1e;border-left:4px solid {color};"
+            f"padding:16px 20px;border-radius:6px;text-align:center;'>"
+            f"<div style='font-size:13px;color:#aaa;'>{label}</div>"
+            f"<div style='font-size:36px;font-weight:700;color:{color};'>{prob:.0%}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("")
+
+    # Expected goals + top scorelines
+    eg1, eg2, eg3 = st.columns([2, 2, 3])
+    with eg1:
+        st.metric(f"{home_team} xG", f"{pred['exp_home_goals']:.2f}")
+    with eg2:
+        st.metric(f"{away_team} xG", f"{pred['exp_away_goals']:.2f}")
+    with eg3:
+        # Most likely scorelines as a compact list
+        st.markdown("**Most Likely Scorelines**")
+        scoreline_md = "  ".join(
+            f"`{sc}` {p:.0%}" for sc, p in pred["top_scorelines"]
+        )
+        st.markdown(scoreline_md)
+
+    st.markdown("---")
+
+    # ── Team form comparison (current season grades) ──────────────────────────
+    st.subheader("Form Comparison")
+
+    # Pull the most recent season's grade row for each team
+    def _latest_grade(team: str, grades_df: pd.DataFrame) -> pd.Series | None:
+        rows = grades_df[grades_df["team"] == team]
+        if rows.empty:
+            return None
+        latest_season = rows["season"].max()
+        r = rows[rows["season"] == latest_season]
+        return r.iloc[0] if not r.empty else None
+
+    home_grade = _latest_grade(home_team, season_grades)
+    away_grade = _latest_grade(away_team, season_grades)
+
+    if home_grade is not None and away_grade is not None:
+        grade_keys = [
+            ("attack_grade",  "⚔️ Attack"),
+            ("defense_grade", "🛡️ Defense"),
+            ("style_grade",   "🎨 Style"),
+            ("overall_grade", "⭐ Overall"),
+        ]
+
+        # Horizontal bar chart showing both teams side by side for each grade
+        fig, axes = plt.subplots(1, len(grade_keys), figsize=(13, 3))
+
+        for ax, (key, label) in zip(axes, grade_keys):
+            hg = float(home_grade.get(key, 5.5))
+            ag = float(away_grade.get(key, 5.5))
+            teams_lbl = [home_team, away_team]
+            vals      = [hg, ag]
+            bar_colors = [
+                "#00c853" if v >= 7 else ("#ffd600" if v >= 4.5 else "#ff1744")
+                for v in vals
+            ]
+            bars = ax.barh(teams_lbl, vals, color=bar_colors, alpha=0.9)
+            ax.set_xlim(0, 10)
+            ax.axvline(5.5, color="white", linestyle="--", alpha=0.3, lw=0.8)
+            ax.set_title(label, color="white", fontsize=10)
+            ax.set_xlabel("Grade", color="white", fontsize=8)
+
+            # Value labels inside bars
+            for bar, val in zip(bars, vals):
+                ax.text(
+                    min(val - 0.3, 9.4), bar.get_y() + bar.get_height() / 2,
+                    f"{val:.1f}", va="center", ha="right",
+                    color="white", fontsize=9, fontweight="bold",
+                )
+            ax.tick_params(colors="white", labelsize=8)
+            ax.set_facecolor("#121212")
+
+        fig.patch.set_facecolor("#0e1117")
+        plt.tight_layout()
+        st.pyplot(fig)
+
+    else:
+        st.info("Grade data not available for one or both teams.")
+
+    # ── Model info expander ──────────────────────────────────────────────────
+    with st.expander("ℹ️ How the model works"):
+        st.markdown(f"""
+**Poisson goals model**
+
+Expected goals are computed for each side using team-specific attack and
+defense strength ratings, relative to the league average:
+
+```
+λ_home = {poisson_model['league_avg']:.3f} × attack({home_team}) × defense({away_team}) × {poisson_model['home_advantage']:.3f}
+λ_away = {poisson_model['league_avg']:.3f} × attack({away_team}) × defense({home_team})
+```
+
+Ratings use each team's last **10 matches** (xG-based) and are shrunk
+toward the league average to prevent extremes from small samples.  W/D/L
+probabilities are summed over a 7×7 scoreline grid.
+
+| Metric | Value |
+|---|---|
+| League avg xG/team/match | {poisson_model['league_avg']:.3f} |
+| Home advantage factor | {poisson_model['home_advantage']:.3f} |
+| {home_team} attack | {poisson_model['team_attack'].get(home_team, 0.85):.3f} |
+| {home_team} defense | {poisson_model['team_defense'].get(home_team, 0.85):.3f} |
+| {away_team} attack | {poisson_model['team_attack'].get(away_team, 0.85):.3f} |
+| {away_team} defense | {poisson_model['team_defense'].get(away_team, 0.85):.3f} |
+        """)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

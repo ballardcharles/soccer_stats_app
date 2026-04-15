@@ -8,11 +8,15 @@ Run with:
     streamlit run dashboard.py
 
 Views available:
+    📋 League Table   — standings, form, goal stats and next fixture
     🎯 Shot Maps      — shot locations and xG per team / player / match
     🔥 Event Heatmaps — WhoScored event density maps by type and period
     📊 Match Analysis — per-match scorecard, xG bar, forecast, shot map
     👤 Player Stats   — season stats table with xG and xA scatter plots
     📈 xG Analysis    — team-level xG aggregates and overperformance charts
+    🏅 Team Grades    — 1-10 attack / defense / style grades, rolling form
+    ⭐ Player Grades  — per-90 offensive + defensive grades by position
+    🔮 Match Predictor — Poisson model W/D/L probabilities for upcoming fixtures
 """
 
 import io
@@ -29,6 +33,7 @@ from mplsoccer import Pitch, VerticalPitch
 
 # Local modules
 sys.path.insert(0, "src")
+from logos import logo_html, logo_path, add_logo_to_ax, load_logo, TEAM_LOGO_IDS
 from scoring import (
     flatten_match_summary,
     compute_season_grades,
@@ -275,6 +280,7 @@ def filter_season(df: pd.DataFrame) -> pd.DataFrame:
 S = {k: filter_season(v) for k, v in D.items()}
 
 view = st.sidebar.selectbox("View:", [
+    "📋 League Table",
     "🎯 Shot Maps",
     "🔥 Event Heatmaps",
     "📊 Match Analysis",
@@ -286,6 +292,203 @@ view = st.sidebar.selectbox("View:", [
 ])
 
 st.sidebar.markdown("---")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📋  LEAGUE TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+# Built entirely from match_crossref.csv — no extra source files needed.
+# Completed matches: home_goals not NaN.
+# Upcoming matches: home_goals is NaN, match_date >= today.
+#
+# Columns: Pos, Team (with crest), P, W, D, L, GF, GA, GD, Pts, Form, Next
+
+if view == "📋 League Table":
+    st.title("📋 League Table")
+
+    mc = D["match_crossref"].copy()
+
+    if mc.empty:
+        st.warning("match_crossref data not available — run `build_processed.py`.")
+        st.stop()
+
+    # Filter to the season selected in the sidebar
+    mc_s = mc[mc["season"] == sel_season].copy() if sel_season else mc.copy()
+    st.caption(f"Season: {sel_season or 'All'}")
+
+    completed = mc_s[mc_s["home_goals"].notna()].copy()
+    upcoming_all = mc_s[mc_s["home_goals"].isna()].copy()
+
+    if completed.empty:
+        st.warning("No completed matches found for this season.")
+        st.stop()
+
+    # ── Build per-team records ────────────────────────────────────────────────
+    # Flatten wide (one row/match) → long (two rows/match, one per team)
+    home_r = completed[["match_date","home_team","away_team","home_goals","away_goals"]].copy()
+    home_r = home_r.rename(columns={"home_team":"team","away_team":"opp",
+                                     "home_goals":"gf","away_goals":"ga"})
+    away_r = completed[["match_date","home_team","away_team","home_goals","away_goals"]].copy()
+    away_r = away_r.rename(columns={"away_team":"team","home_team":"opp",
+                                     "away_goals":"gf","home_goals":"ga"})
+    flat = pd.concat([home_r, away_r], ignore_index=True)
+    flat["gf"] = flat["gf"].astype(float)
+    flat["ga"] = flat["ga"].astype(float)
+    flat["w"]  = (flat["gf"] > flat["ga"]).astype(int)
+    flat["d"]  = (flat["gf"] == flat["ga"]).astype(int)
+    flat["l"]  = (flat["gf"] < flat["ga"]).astype(int)
+
+    tbl = (
+        flat.groupby("team", sort=False)
+        .agg(P=("gf","count"), W=("w","sum"), D=("d","sum"), L=("l","sum"),
+             GF=("gf","sum"), GA=("ga","sum"))
+        .reset_index()
+    )
+    tbl["GD"]  = (tbl["GF"] - tbl["GA"]).astype(int)
+    tbl["Pts"] = (3 * tbl["W"] + tbl["D"]).astype(int)
+    tbl["GF"]  = tbl["GF"].astype(int)
+    tbl["GA"]  = tbl["GA"].astype(int)
+    tbl = tbl.sort_values(["Pts","GD","GF"], ascending=False).reset_index(drop=True)
+    tbl.insert(0, "Pos", range(1, len(tbl) + 1))
+
+    # ── Form: last 5 results, most recent rightmost ───────────────────────────
+    flat_sorted = flat.sort_values("match_date")
+    def _form(team_name: str) -> str:
+        recent = flat_sorted[flat_sorted["team"] == team_name].tail(5)
+        def _emoji(r):
+            if r["w"]: return "🟢"
+            if r["d"]: return "⚪"
+            return "🔴"
+        return "".join(_emoji(r) for _, r in recent.iterrows())
+
+    tbl["Form"] = tbl["team"].apply(_form)
+
+    # ── Next fixture per team ─────────────────────────────────────────────────
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    upcoming_all["match_date"] = pd.to_datetime(upcoming_all["match_date"], utc=True, errors="coerce")
+    future = upcoming_all[upcoming_all["match_date"] >= today].copy()
+
+    def _next(team_name: str) -> str:
+        h = future[future["home_team"] == team_name].sort_values("match_date")
+        a = future[future["away_team"] == team_name].sort_values("match_date")
+        opts = []
+        if not h.empty:
+            r = h.iloc[0]
+            opts.append((r["match_date"], f"{r['match_date'].strftime('%d %b')}  v {r['away_team']} (H)"))
+        if not a.empty:
+            r = a.iloc[0]
+            opts.append((r["match_date"], f"{r['match_date'].strftime('%d %b')}  @ {r['home_team']} (A)"))
+        if not opts:
+            return "—"
+        opts.sort(key=lambda x: x[0])
+        return opts[0][1]
+
+    tbl["Next Match"] = tbl["team"].apply(_next)
+
+    # ── Table display with crest in team name ─────────────────────────────────
+    # Build a "Team" column with inline HTML crest + name for st.markdown table.
+    # The dataframe itself uses plain text; crests are shown above as a header row.
+    disp = tbl[["Pos","team","P","W","D","L","GF","GA","GD","Pts","Form","Next Match"]].copy()
+    disp = disp.rename(columns={"team": "Team"})
+
+    # Render as HTML table so crests appear inline with team names
+    def _team_html(name: str) -> str:
+        return logo_html(name, size=20) + name
+
+    _NUM_COLS = {"Pos", "P", "W", "D", "L", "GF", "GA", "GD", "Pts"}
+    html_rows = []
+    th_cells = []
+    for c in disp.columns:
+        align = "right" if c in _NUM_COLS else "left"
+        th_cells.append(
+            f"<th style='padding:6px 10px;text-align:{align};"
+            f"color:#aaa;border-bottom:1px solid #333;'>{c}</th>"
+        )
+    header = "<tr>" + "".join(th_cells) + "</tr>"
+
+    for _, row in disp.iterrows():
+        cells = []
+        for col in disp.columns:
+            val = row[col]
+            align = "right" if col in ("Pos","P","W","D","L","GF","GA","GD","Pts") else "left"
+            if col == "Team":
+                val = _team_html(val)
+            # Colour GD green/red
+            if col == "GD":
+                color = "#00c853" if val > 0 else ("#ff1744" if val < 0 else "#aaa")
+                cell = f"<td style='padding:5px 10px;text-align:{align};color:{color};font-weight:600;'>{val:+d}</td>"
+            elif col == "Pts":
+                cell = f"<td style='padding:5px 10px;text-align:{align};font-weight:700;color:#00ff85;'>{val}</td>"
+            elif col == "Pos":
+                cell = f"<td style='padding:5px 10px;text-align:{align};color:#888;'>{val}</td>"
+            else:
+                cell = f"<td style='padding:5px 10px;text-align:{align};'>{val}</td>"
+            cells.append(cell)
+        html_rows.append("<tr style='border-bottom:1px solid #1e1e1e;'>" + "".join(cells) + "</tr>")
+
+    table_html = f"""
+    <div style='overflow-x:auto;'>
+    <table style='width:100%;border-collapse:collapse;background:#0e1117;color:#e8e8e8;font-size:13px;'>
+    <thead style='background:#1a1a2e;'>{header}</thead>
+    <tbody>{"".join(html_rows)}</tbody>
+    </table>
+    </div>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Charts: Points bar + GF vs GA scatter ────────────────────────────────
+    c1, c2 = st.columns(2)
+
+    with c1:
+        # Horizontal bar chart — lowest points at bottom, highest at top
+        st.subheader("Points")
+        pts_s = tbl.sort_values("Pts", ascending=True).copy()
+        fig, ax = plt.subplots(figsize=(6, max(4, len(pts_s) * 0.30)))
+        bars = ax.barh(pts_s["team"], pts_s["Pts"], color=PURPLE,
+                       edgecolor=GREEN, linewidth=0.4, alpha=0.9)
+        # Overlay crest on each bar
+        for bar, team in zip(bars, pts_s["team"]):
+            img = load_logo(team)
+            if img is not None:
+                add_logo_to_ax(ax, team,
+                               xy=(bar.get_width() - 1.0, bar.get_y() + bar.get_height() / 2),
+                               size=0.022, coords="data")
+        ax.set_xlabel("Points")
+        ax.tick_params(axis="y", labelsize=7)
+        ax.grid(axis="x", alpha=0.2)
+        dark_fig_style(fig, ax)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    with c2:
+        # GF vs GA scatter — colour encodes goal difference
+        st.subheader("Goals For vs Against")
+        gd_vals = tbl["GD"].values.astype(float)
+        vmax = max(abs(gd_vals).max(), 1)
+        norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+        fig, ax = plt.subplots(figsize=(6, 5))
+        sc = ax.scatter(tbl["GF"], tbl["GA"],
+                        c=gd_vals, cmap="RdYlGn", norm=norm,
+                        s=90, edgecolors="#555", linewidths=0.5, zorder=3)
+        max_v = max(tbl["GF"].max(), tbl["GA"].max()) + 4
+        ax.plot([0, max_v], [0, max_v], color="#555", lw=0.8, ls="--", zorder=1)
+        for _, r in tbl.iterrows():
+            ax.annotate(r["team"], (r["GF"], r["GA"]),
+                        fontsize=6, color="white",
+                        xytext=(3, 3), textcoords="offset points")
+        ax.set_xlabel("Goals For")
+        ax.set_ylabel("Goals Against")
+        cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+        cbar.ax.tick_params(colors="white", labelsize=7)
+        cbar.set_label("Goal Diff", color="white", fontsize=8)
+        ax.grid(alpha=0.2)
+        dark_fig_style(fig, ax)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,7 +504,7 @@ st.sidebar.markdown("---")
 #   y = 0  →  top touchline, y = 100 → bottom touchline
 # mplsoccer's opta pitch has y=0 at the bottom, so we flip: y_plot = 100 - y
 
-if view == "🎯 Shot Maps":
+elif view == "🎯 Shot Maps":
     st.title("🎯 Shot Maps")
 
     shots = S["shots"]
@@ -1131,7 +1334,10 @@ elif view == "🏅 Team Grades":
 
     # ── Season grade card for selected team ───────────────────────────────────
     st.markdown("---")
-    st.subheader(f"{sel_gt} — Season Grades ({sel_gs})")
+    st.markdown(
+        logo_html(sel_gt, size=28) + f"&nbsp;<b style='font-size:18px'>{sel_gt} — Season Grades ({sel_gs})</b>",
+        unsafe_allow_html=True,
+    )
 
     team_row = season_grades[
         (season_grades["season"] == sel_gs) & (season_grades["team"] == sel_gt)
@@ -1468,7 +1674,12 @@ elif view == "🔮 Match Predictor":
     away_team = fixture_row["away_team"]
     match_date_str = pd.to_datetime(fixture_row["match_date"]).strftime("%A %-d %B %Y")
 
-    st.markdown(f"### {home_team}  vs  {away_team}")
+    st.markdown(
+        logo_html(home_team, size=32) + f"&nbsp;<b>{home_team}</b>"
+        + "&nbsp;&nbsp;vs&nbsp;&nbsp;"
+        + logo_html(away_team, size=32) + f"&nbsp;<b>{away_team}</b>",
+        unsafe_allow_html=True,
+    )
     st.caption(f"📅 {match_date_str}")
     st.markdown("---")
 

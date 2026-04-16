@@ -13,10 +13,12 @@ Views available:
     🔥 Event Heatmaps — WhoScored event density maps by type and period
     📊 Match Analysis — per-match scorecard, xG bar, forecast, shot map
     👤 Player Stats   — season stats table with xG and xA scatter plots
-    📈 xG Analysis    — team-level xG aggregates and overperformance charts
+    📈 xG Analysis    — team + player xG performance, over/underperformance, hover tooltips
     🏅 Team Grades    — 1-10 attack / defense / style grades, rolling form
     ⭐ Player Grades  — per-90 offensive + defensive grades by position
     🔮 Match Predictor — Poisson model W/D/L probabilities for upcoming fixtures
+    ⚡ Shot Quality   — zone quality hexbin maps and team shot-quality rankings
+    ⚔️ Head-to-Head   — radar comparison, H2H record, and key stats table
 """
 
 import io
@@ -25,8 +27,11 @@ import warnings
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from matplotlib.lines import Line2D
 from mplsoccer import Pitch, VerticalPitch
@@ -76,61 +81,82 @@ PURPLE      = "#37003c"   # Premier League deep purple (bars, accents)
 GREEN       = "#00ff85"   # Premier League neon green (highlights, goals)
 PITCH_GREEN = "#1a472a"   # Dark grass green used as the pitch background
 
-# Root folder where build_processed.py writes its output CSVs.
+# Paths — DB is preferred; CSVs are the fallback for local dev without a built DB.
+DB_PATH   = "soccer_stats.db"
 PROCESSED = "data/processed"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
-# @st.cache_data tells Streamlit to run this function only once and cache the
-# result in memory. Subsequent page interactions reuse the cached DataFrames
-# instead of re-reading from disk — keeps the app fast.
+# Prefers soccer_stats.db (SQLite) for fast, memory-efficient loading.
+# Falls back to individual CSVs in data/processed/ for local dev convenience.
+# @st.cache_data ensures the data is read from disk only once per session.
 
 @st.cache_data
 def load_data() -> dict[str, pd.DataFrame]:
-    """Load all processed CSVs into a single dictionary of DataFrames."""
+    """Load all data tables into a single dictionary of DataFrames.
 
+    Reads from soccer_stats.db (SQLite) if it exists, otherwise falls back
+    to the individual CSVs in data/processed/.
+    """
+    import os, sqlite3
+
+    def _parse_dates(dfs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        for key in ("shots", "events", "match_summary", "lineups", "match_crossref"):
+            df = dfs.get(key, pd.DataFrame())
+            if "match_date" in df.columns:
+                df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
+        return dfs
+
+    # ── Primary path: SQLite ──────────────────────────────────────────────────
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        def _tbl(name: str) -> pd.DataFrame:
+            try:
+                return pd.read_sql_query(f"SELECT * FROM {name}", conn)
+            except Exception:
+                return pd.DataFrame()
+
+        dfs = dict(
+            shots         = _tbl("shots"),
+            events        = _tbl("events"),
+            match_summary = _tbl("match_summary"),
+            match_crossref= _tbl("match_crossref"),
+            player_season = _tbl("player_season"),
+            lineups       = _tbl("lineups"),
+        )
+        conn.close()
+        return _parse_dates(dfs)
+
+    # ── Fallback path: CSVs ───────────────────────────────────────────────────
     def safe_read(name: str) -> pd.DataFrame:
-        # Returns an empty DataFrame instead of crashing if a file is missing.
-        # This lets the app start and show a warning rather than erroring out.
         try:
             return pd.read_csv(f"{PROCESSED}/{name}", low_memory=False)
         except FileNotFoundError:
             return pd.DataFrame()
 
-    shots         = safe_read("shots.csv")         # Understat shot-level data
-    events        = safe_read("events.csv")         # WhoScored full event stream
-    match_summary = safe_read("match_summary.csv")  # One row per match (xG, goals, forecasts)
-    match_crossref = safe_read("match_crossref.csv") # All fixtures incl. upcoming (NaN goals)
-    player_season = safe_read("player_season.csv")  # Understat player season totals
-    lineups       = safe_read("lineups.csv")         # ESPN lineup data (unused in current views)
-
-    # Parse match_date to a proper datetime once at load time.
-    # errors="coerce" turns unparseable values into NaT rather than crashing.
-    for df in (shots, events, match_summary, lineups, match_crossref):
-        if "match_date" in df.columns:
-            df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
-
-    return dict(
-        shots=shots,
-        events=events,
-        match_summary=match_summary,
-        match_crossref=match_crossref,
-        player_season=player_season,
-        lineups=lineups,
+    dfs = dict(
+        shots         = safe_read("shots.csv"),
+        events        = safe_read("events.csv"),
+        match_summary = safe_read("match_summary.csv"),
+        match_crossref= safe_read("match_crossref.csv"),
+        player_season = safe_read("player_season.csv"),
+        lineups       = safe_read("lineups.csv"),
     )
+    return _parse_dates(dfs)
 
 
-# Show a spinner while the CSVs load, then store everything in D.
+# Show a spinner while data loads, then store everything in D.
 with st.spinner("Loading data…"):
     D = load_data()
 
-# If every DataFrame came back empty (files not yet generated), stop early
-# and tell the user what to run.
+# If every DataFrame came back empty (neither DB nor CSVs found), stop early.
 if all(v.empty for v in D.values()):
-    st.error("No processed data found in `data/processed/`. "
-             "Run `python build_processed.py` first.")
+    st.error(
+        "No data found. Run `python build_processed.py` then `python build_db.py`, "
+        "or place CSVs in `data/processed/`."
+    )
     st.stop()
 
 
@@ -235,6 +261,53 @@ def _get_upcoming(crossref_df: pd.DataFrame) -> pd.DataFrame:
     return get_upcoming_fixtures(crossref_df)
 
 
+def _team_row(df: pd.DataFrame, team: str) -> pd.Series | None:
+    """Return the single row for *team* from a team-indexed DataFrame, or None."""
+    rows = df[df["team"] == team]
+    return rows.iloc[0] if not rows.empty else None
+
+
+@st.cache_data
+def _flatten_ms(ms: pd.DataFrame) -> pd.DataFrame:
+    """Flatten match_summary from wide (one row/match) to long (one row/team/match).
+
+    Returns a DataFrame with columns:
+        team, xg_for, xg_against, goals_for, goals_against,
+        possession_pct, pass_pct, shot_pct, tackle_pct  (where available)
+
+    Used by xG Performance and Head-to-Head views to avoid duplicating
+    the home/away pivot logic.
+    """
+    if ms.empty:
+        return pd.DataFrame()
+
+    pct_pairs = [
+        ("home_possession_pct", "away_possession_pct", "possession_pct"),
+        ("home_pass_pct",       "away_pass_pct",       "pass_pct"),
+        ("home_shot_pct",       "away_shot_pct",       "shot_pct"),
+        ("home_tackle_pct",     "away_tackle_pct",     "tackle_pct"),
+    ]
+
+    home_cols = {"home_team": "team", "home_xg": "xg_for", "away_xg": "xg_against",
+                 "home_goals": "goals_for", "away_goals": "goals_against"}
+    away_cols = {"away_team": "team", "away_xg": "xg_for", "home_xg": "xg_against",
+                 "away_goals": "goals_for", "home_goals": "goals_against"}
+
+    base_home = ms[[c for c in home_cols if c in ms.columns]].rename(columns=home_cols)
+    base_away = ms[[c for c in away_cols if c in ms.columns]].rename(columns=away_cols)
+
+    for h_col, a_col, out_col in pct_pairs:
+        if h_col in ms.columns:
+            base_home[out_col] = ms[h_col].values
+        if a_col in ms.columns:
+            base_away[out_col] = ms[a_col].values
+
+    flat = pd.concat([base_home, base_away], ignore_index=True)
+    num_cols = [c for c in flat.columns if c != "team"]
+    flat[num_cols] = flat[num_cols].apply(pd.to_numeric, errors="coerce")
+    return flat
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR — SEASON SELECTOR + VIEW SELECTOR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,6 +362,8 @@ view = st.sidebar.selectbox("View:", [
     "🏅 Team Grades",
     "⭐ Player Grades",
     "🔮 Match Predictor",
+    "⚡ Shot Quality",
+    "⚔️ Head-to-Head",
 ])
 
 st.sidebar.markdown("---")
@@ -442,53 +517,61 @@ if view == "📋 League Table":
     c1, c2 = st.columns(2)
 
     with c1:
-        # Horizontal bar chart — lowest points at bottom, highest at top
         st.subheader("Points")
         pts_s = tbl.sort_values("Pts", ascending=True).copy()
-        fig, ax = plt.subplots(figsize=(6, max(4, len(pts_s) * 0.30)))
-        bars = ax.barh(pts_s["team"], pts_s["Pts"], color=PURPLE,
-                       edgecolor=GREEN, linewidth=0.4, alpha=0.9)
-        # Overlay crest on each bar
-        for bar, team in zip(bars, pts_s["team"]):
-            img = load_logo(team)
-            if img is not None:
-                add_logo_to_ax(ax, team,
-                               xy=(bar.get_width() - 1.0, bar.get_y() + bar.get_height() / 2),
-                               size=0.022, coords="data")
-        ax.set_xlabel("Points")
-        ax.tick_params(axis="y", labelsize=7)
-        ax.grid(axis="x", alpha=0.2)
-        dark_fig_style(fig, ax)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+        fig_pts = px.bar(
+            pts_s, x="Pts", y="team", orientation="h",
+            color="Pts", color_continuous_scale=[[0, PURPLE], [1, GREEN]],
+            hover_name="team",
+            hover_data={"Pts": True, "W": True, "D": True, "L": True,
+                        "GF": True, "GA": True, "GD": True, "team": False},
+            height=max(350, len(pts_s) * 28),
+        )
+        fig_pts.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+            font=dict(color="white"), showlegend=False,
+            coloraxis_showscale=False,
+            xaxis=dict(gridcolor="#333", title="Points"),
+            yaxis=dict(title="", tickfont=dict(size=11)),
+            margin=dict(t=10, b=10, l=10, r=10),
+        )
+        fig_pts.update_traces(marker_line_width=0)
+        st.plotly_chart(fig_pts, use_container_width=True)
 
     with c2:
-        # GF vs GA scatter — colour encodes goal difference
         st.subheader("Goals For vs Against")
-        gd_vals = tbl["GD"].values.astype(float)
-        vmax = max(abs(gd_vals).max(), 1)
-        norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
-        fig, ax = plt.subplots(figsize=(6, 5))
-        sc = ax.scatter(tbl["GF"], tbl["GA"],
-                        c=gd_vals, cmap="RdYlGn", norm=norm,
-                        s=90, edgecolors="#555", linewidths=0.5, zorder=3)
-        max_v = max(tbl["GF"].max(), tbl["GA"].max()) + 4
-        ax.plot([0, max_v], [0, max_v], color="#555", lw=0.8, ls="--", zorder=1)
-        for _, r in tbl.iterrows():
-            ax.annotate(r["team"], (r["GF"], r["GA"]),
-                        fontsize=6, color="white",
-                        xytext=(3, 3), textcoords="offset points")
-        ax.set_xlabel("Goals For")
-        ax.set_ylabel("Goals Against")
-        cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-        cbar.ax.tick_params(colors="white", labelsize=7)
-        cbar.set_label("Goal Diff", color="white", fontsize=8)
-        ax.grid(alpha=0.2)
-        dark_fig_style(fig, ax)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+        tbl_plot = tbl.copy()
+        tbl_plot["GD_label"] = tbl_plot["GD"].apply(lambda v: f"{v:+d}")
+        max_v = max(tbl_plot["GF"].max(), tbl_plot["GA"].max()) + 5
+        fig_gf = px.scatter(
+            tbl_plot, x="GF", y="GA",
+            color="GD", color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
+            text="team",
+            hover_name="team",
+            hover_data={"GF": True, "GA": True, "GD": True,
+                        "Pts": True, "W": True, "D": True, "L": True,
+                        "team": False},
+            height=420,
+        )
+        # y=x parity line (GF=GA)
+        fig_gf.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v,
+                         line=dict(color="#555", width=1, dash="dot"))
+        fig_gf.update_traces(
+            textposition="top center",
+            textfont=dict(size=9, color="white"),
+            marker=dict(size=11, line=dict(width=0.5, color="#555")),
+        )
+        fig_gf.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+            font=dict(color="white"),
+            coloraxis_colorbar=dict(title=dict(text="GD", font=dict(color="white")),
+                                    tickfont=dict(color="white")),
+            xaxis=dict(gridcolor="#333", zerolinecolor="#555", range=[0, max_v]),
+            yaxis=dict(gridcolor="#333", zerolinecolor="#555", range=[0, max_v]),
+            margin=dict(t=10, b=10),
+        )
+        st.plotly_chart(fig_gf, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -657,6 +740,7 @@ elif view == "🎯 Shot Maps":
     ax.set_title(title, fontsize=12, fontweight="bold", color="white", pad=10)
     fig.patch.set_facecolor("#0e1117")
     st.pyplot(fig)
+    plt.close(fig)
 
     # ── Download buttons ──────────────────────────────────────────────────────
     # io.StringIO / io.BytesIO are in-memory file buffers — no temp file on disk.
@@ -689,6 +773,7 @@ elif view == "🎯 Shot Maps":
             dark_fig_style(fig2, ax2)
             plt.tight_layout()
             st.pyplot(fig2)
+            plt.close(fig2)
     with c2:
         if "situation" in filtered.columns and filtered["situation"].notna().any():
             st.subheader("Situation")
@@ -700,6 +785,7 @@ elif view == "🎯 Shot Maps":
             dark_fig_style(fig3, ax3)
             plt.tight_layout()
             st.pyplot(fig3)
+            plt.close(fig3)
 
     # ── Shot detail table ─────────────────────────────────────────────────────
     # Sorted by xG descending so highest-quality chances appear first.
@@ -745,35 +831,46 @@ elif view == "🔥 Event Heatmaps":
     with r1a:
         sel_team = st.selectbox("Team:", team_list(events, "team"))
 
-    # Filter the full events table down to just this team before building the
-    # match dropdown — otherwise match_label() would show every match in the dataset.
+    # Filter to this team and pre-compute match labels once — reused for the
+    # match dropdown, the player dropdown, and the match filter below.
     team_events_all = events[events["team"] == sel_team].copy()
+    if {"match_date", "home_team", "away_team"}.issubset(team_events_all.columns):
+        team_events_all["match_date"] = pd.to_datetime(
+            team_events_all["match_date"], errors="coerce"
+        )
+        team_events_all["_label"] = team_events_all.apply(match_label, axis=1)
 
     with r1b:
-        if {"match_date", "home_team", "away_team"}.issubset(team_events_all.columns):
-            team_events_all["match_date"] = pd.to_datetime(
-                team_events_all["match_date"], errors="coerce"
-            )
-            # Build one label per unique match, sorted most recent first.
-            # drop_duplicates("label") prevents the same game appearing multiple
-            # times (once per event row).
+        if "_label" in team_events_all.columns:
             match_opts = (
                 team_events_all.dropna(subset=["match_date", "home_team", "away_team"])
-                .assign(label=lambda df: df.apply(match_label, axis=1))
-                .drop_duplicates("label")
-                .sort_values("match_date", ascending=False)["label"]
+                .drop_duplicates("_label")
+                .sort_values("match_date", ascending=False)["_label"]
                 .tolist()
             )
             sel_match = st.selectbox("Match:", ["All Matches"] + match_opts)
         else:
             sel_match = "All Matches"
 
+    # ── Row 1.5: Player selector ──────────────────────────────────────────────
+    # Narrow to the chosen match before building player list so only players
+    # who appeared in that game are shown.
+    if sel_match != "All Matches" and "_label" in team_events_all.columns:
+        ev_for_players = team_events_all[team_events_all["_label"] == sel_match]
+    else:
+        ev_for_players = team_events_all
+
+    if "player" in ev_for_players.columns:
+        player_opts = sorted(
+            ev_for_players["player"].dropna().astype(str).unique().tolist()
+        )
+        sel_player = st.selectbox("Player:", ["All Players"] + player_opts)
+    else:
+        sel_player = "All Players"
+
     # ── Row 2: Event types + Period ───────────────────────────────────────────
-    # Event types multiselect — can combine e.g. Pass + BallTouch to see
-    # total touches.  Column widths [3,1] give more space to the multiselect.
     r2a, r2b = st.columns([3, 1])
     with r2a:
-        # Pre-select a sensible default if those types exist in the data.
         default_types = [t for t in ["Pass", "BallTouch", "TackleX"] if t in event_types]
         sel_types = st.multiselect("Event Types:", event_types,
                                    default=default_types or event_types[:3])
@@ -783,10 +880,12 @@ elif view == "🔥 Event Heatmaps":
     # ── Apply filters ─────────────────────────────────────────────────────────
     ev = team_events_all.copy()
 
-    # Match filter: compare the computed label string against the selection.
-    if sel_match != "All Matches":
-        ev_labels = ev.apply(match_label, axis=1)
-        ev = ev[ev_labels == sel_match]
+    if sel_match != "All Matches" and "_label" in ev.columns:
+        ev = ev[ev["_label"] == sel_match]
+
+    # Player filter: narrow to a single player when one is chosen.
+    if sel_player != "All Players" and "player" in ev.columns:
+        ev = ev[ev["player"].astype(str) == sel_player]
 
     # Event type filter: keep only rows whose 'type' is in the selected list.
     if sel_types:
@@ -798,70 +897,169 @@ elif view == "🔥 Event Heatmaps":
         target = "FirstHalf" if sel_period == "1st Half" else "SecondHalf"
         ev = ev[ev["period"] == target]
 
-    # Drop rows with missing coordinates — can't plot them.
+    # Drop rows with missing start coordinates — can't plot them.
     valid = ev.dropna(subset=["x", "y"])
-    st.metric("Events plotted", len(valid))
 
-    if valid.empty:
-        st.warning("No events match the selected filters.")
+    # ── Display mode toggle ───────────────────────────────────────────────────
+    disp_mode = st.radio(
+        "Display mode:",
+        ["🔥 Heatmap", "↗ Arrow Map"],
+        horizontal=True,
+    )
+
+    # For arrow map, further require end coordinates.
+    if disp_mode == "↗ Arrow Map":
+        valid_arrows = valid.dropna(subset=["end_x", "end_y"])
+        n_plotted = len(valid_arrows)
+    else:
+        n_plotted = len(valid)
+
+    st.metric("Events plotted", n_plotted)
+
+    if n_plotted == 0:
+        st.warning("No events match the selected filters." if len(valid) == 0
+                   else "No events with end coordinates — try selecting Pass or Shot types.")
         st.stop()
 
-    # ── Pitch and KDE heatmap ─────────────────────────────────────────────────
+    # Build a descriptive title from all active filter selections.
+    type_str   = ", ".join(sel_types) if sel_types else "All Events"
+    match_str  = sel_match if sel_match != "All Matches" else "All Matches"
+    player_str = f"  ·  {sel_player}" if sel_player != "All Players" else ""
+    title_str  = (
+        f"{sel_team}{player_str}  ·  {type_str}  ·  {match_str}  ({sel_period})"
+    )
+
     pitch = Pitch(
         pitch_type="opta",
         pitch_color=PITCH_GREEN, line_color="white",
         line_zorder=2, linewidth=1.5,
     )
-    fig, ax = pitch.draw(figsize=(12, 7))
 
-    if len(valid) >= 5:
-        # kdeplot fits a 2D Kernel Density Estimate over the (x, y) coordinates.
-        # cmap="hot" goes black → red → yellow, making dense areas bright yellow.
-        # thresh=0.02 hides the bottom 2% of density (sparse outer regions).
-        # levels=15 controls the smoothness of the density bands.
-        pitch.kdeplot(
-            valid["x"].values,
-            (100 - valid["y"]).values,   # flip y to match mplsoccer opta orientation
-            ax=ax,
-            cmap="hot", fill=True,
-            alpha=0.72, thresh=0.02, levels=15,
-            zorder=2,
-        )
+    # ── Heatmap branch ────────────────────────────────────────────────────────
+    if disp_mode == "🔥 Heatmap":
+        fig, ax = pitch.draw(figsize=(12, 7))
+
+        if len(valid) >= 5:
+            # kdeplot fits a 2D Kernel Density Estimate over the (x, y)
+            # coordinates. cmap="hot": black → red → yellow for dense areas.
+            # thresh=0.02 hides the bottom 2% of density (sparse outer edges).
+            # WhoScored Opta: x=0→100 (own→opponent goal),
+            # y=0→100 (left→right touchline) — matches mplsoccer opta directly.
+            pitch.kdeplot(
+                valid["x"].values,
+                valid["y"].values,
+                ax=ax,
+                cmap="hot", fill=True,
+                alpha=0.72, thresh=0.02, levels=15,
+                zorder=2,
+            )
+        else:
+            pitch.scatter(
+                valid["x"].values,
+                valid["y"].values,
+                ax=ax, s=120, color="tomato",
+                edgecolors="white", linewidths=0.6,
+                zorder=3,
+            )
+            ax.text(50, 95, f"Only {len(valid)} events — showing scatter",
+                   ha="center", fontsize=10, color="white",
+                   bbox=dict(boxstyle="round", facecolor="#333", alpha=0.8, pad=0.4))
+
+        ax.set_title(title_str, fontsize=12, fontweight="bold", color="white", pad=12)
+        fig.patch.set_facecolor("#0e1117")
+        st.pyplot(fig)
+
+    # ── Arrow Map branch ──────────────────────────────────────────────────────
     else:
-        # KDE needs at least a handful of spread-out points to work.
-        # For very sparse filters, fall back to individual event dots instead.
-        pitch.scatter(
-            valid["x"].values,
-            (100 - valid["y"]).values,
-            ax=ax, s=120, color="tomato",
-            edgecolors="white", linewidths=0.6,
+        fig, ax = pitch.draw(figsize=(12, 7))
+
+        # Compute Euclidean distance in Opta units (0-100 scale).
+        dx = valid_arrows["end_x"] - valid_arrows["x"]
+        dy = valid_arrows["end_y"] - valid_arrows["y"]
+        dist = np.sqrt(dx**2 + dy**2)
+
+        # Fixed arrow width — only the length varies with pass distance.
+        ARROW_W = 1.5
+
+        # Color by outcome: green = Successful, red = Unsuccessful / other.
+        has_outcome = "outcome_type" in valid_arrows.columns
+        if has_outcome:
+            colors = np.where(
+                valid_arrows["outcome_type"].astype(str).str.lower() == "successful",
+                "#44dd88",   # green
+                "#ff4b4b",   # red
+            )
+        else:
+            colors = ["#f5a623"] * len(valid_arrows)  # amber fallback
+
+        # Single vectorised call — pitch.arrows accepts full arrays for all
+        # positional and colour arguments, so no per-row loop is needed.
+        pitch.arrows(
+            valid_arrows["x"].values, valid_arrows["y"].values,
+            valid_arrows["end_x"].values, valid_arrows["end_y"].values,
+            ax=ax,
+            color=colors,
+            width=ARROW_W,
+            headwidth=ARROW_W * 2.5,
+            headlength=ARROW_W * 2.0,
+            headaxislength=ARROW_W * 1.8,
+            alpha=0.75,
             zorder=3,
         )
-        ax.text(50, 95, f"Only {len(valid)} events — showing scatter",
-               ha="center", fontsize=10, color="white",
-               bbox=dict(boxstyle="round", facecolor="#333", alpha=0.8, pad=0.4))
 
-    # Build a descriptive title from all active filter selections.
-    type_str  = ", ".join(sel_types) if sel_types else "All Events"
-    match_str = sel_match if sel_match != "All Matches" else "All Matches"
-    ax.set_title(f"{sel_team}  ·  {type_str}  ·  {match_str}  ({sel_period})",
-                fontsize=12, fontweight="bold", color="white", pad=12)
-    fig.patch.set_facecolor("#0e1117")
-    st.pyplot(fig)
+        # Legend + stats sidebar
+        ax.set_title(title_str, fontsize=12, fontweight="bold", color="white", pad=12)
+        fig.patch.set_facecolor("#0e1117")
+
+        # Inline legend patches
+        legend_handles = []
+        if has_outcome:
+            legend_handles += [
+                mpatches.Patch(color="#44dd88", label="Successful"),
+                mpatches.Patch(color="#ff4b4b", label="Unsuccessful"),
+            ]
+        legend_handles.append(
+            mpatches.Patch(color="none",
+                           label=f"Avg dist: {dist.mean():.1f}  |  Max: {dist.max():.1f}")
+        )
+        ax.legend(
+            handles=legend_handles,
+            loc="lower right", framealpha=0.35,
+            fontsize=9, labelcolor="white",
+            facecolor="#111", edgecolor="#555",
+        )
+
+        st.pyplot(fig)
+
+        # Summary metrics row
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Avg distance", f"{dist.mean():.1f} meters")
+        m2.metric("Longest", f"{dist.max():.1f} meters")
+        if has_outcome:
+            n_succ = (valid_arrows["outcome_type"].astype(str).str.lower() == "successful").sum()
+            m3.metric("Success rate", f"{100 * n_succ / len(valid_arrows):.0f}%")
 
     img = io.BytesIO()
     fig.savefig(img, format="png", bbox_inches="tight", dpi=150)
-    st.download_button("📥 Heatmap (PNG)", img.getvalue(),
-                      file_name="event_heatmap.png", mime="image/png")
+    fname = "arrow_map.png" if disp_mode == "↗ Arrow Map" else "event_heatmap.png"
+    label = "📥 Arrow Map (PNG)" if disp_mode == "↗ Arrow Map" else "📥 Heatmap (PNG)"
+    st.download_button(label, img.getvalue(), file_name=fname, mime="image/png")
+    plt.close(fig)
 
     # ── Event type breakdown bar chart ────────────────────────────────────────
-    # Shows a count of every event type for this team / period so you can see
-    # which actions dominate their game.  head(20) limits to the top 20 types.
+    # Shows a count of every event type for this team/player/period so you can
+    # see which actions dominate.  head(20) limits to the top 20 types.
     # The [::-1] reversal puts the most common type at the top of the bar chart.
     st.markdown("---")
-    st.subheader(f"{sel_team} — Event Type Breakdown ({sel_period})")
+    breakdown_subject = sel_player if sel_player != "All Players" else sel_team
+    st.subheader(f"{breakdown_subject} — Event Type Breakdown ({sel_period})")
+    _bc = team_events_all.copy()
+    if sel_match != "All Matches" and "_label" in _bc.columns:
+        _bc = _bc[_bc["_label"] == sel_match]
+    if sel_player != "All Players" and "player" in _bc.columns:
+        _bc = _bc[_bc["player"].astype(str) == sel_player]
     type_counts = (
-        events[events["team"] == sel_team]
+        _bc
         .pipe(lambda df: df[df["period"] == "FirstHalf"]  if sel_period == "1st Half"
               else (df[df["period"] == "SecondHalf"] if sel_period == "2nd Half" else df))
         ["type"].value_counts().head(20)
@@ -873,6 +1071,7 @@ elif view == "🔥 Event Heatmaps":
     dark_fig_style(fig2, ax2)
     plt.tight_layout()
     st.pyplot(fig2)
+    plt.close(fig2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -961,6 +1160,7 @@ elif view == "📊 Match Analysis":
         dark_fig_style(fig, ax)
         plt.tight_layout()
         st.pyplot(fig)
+        plt.close(fig)
 
     # ── Pre-match forecast ────────────────────────────────────────────────────
     # Understat's forecast probabilities are generated before kick-off from
@@ -1017,6 +1217,7 @@ elif view == "📊 Match Analysis":
                 )
             fig.patch.set_facecolor("#0e1117")
             st.pyplot(fig)
+            plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1080,79 +1281,96 @@ elif view == "👤 Player Stats":
     c1, c2 = st.columns(2)
 
     with c1:
-        # ── Goals vs xG scatter ───────────────────────────────────────────────
-        # Each dot is one player.  The dashed diagonal line represents perfect
-        # xG prediction (Goals = xG).  Players above the line are
-        # overperforming their xG (scoring more than expected); players below
-        # are underperforming.  Dot colour also encodes xG (green=high).
-        # The top 6 by xG are labelled to identify key players easily.
         st.subheader("Goals vs xG")
         if {"goals", "xg"}.issubset(filtered.columns) and len(filtered) > 1:
-            fig, ax = plt.subplots(figsize=(6, 5))
-            sc = ax.scatter(
-                filtered["xg"], filtered["goals"],
-                s=60, alpha=0.75,
-                c=filtered["xg"], cmap="RdYlGn",   # red=low xG, green=high
-                edgecolors="white", linewidths=0.4,
+            ps_plot = filtered.copy()
+            for col in ("xg", "goals"):
+                ps_plot[col] = pd.to_numeric(ps_plot[col], errors="coerce")
+            ps_plot = ps_plot.dropna(subset=["xg", "goals"])
+            ps_plot["diff"] = (ps_plot["goals"] - ps_plot["xg"]).round(2)
+            ps_plot["xg"]   = ps_plot["xg"].round(2)
+            ps_plot["goals"] = ps_plot["goals"].round(2)
+            lim = max(ps_plot["xg"].max(), ps_plot["goals"].max()) * 1.08
+            fig_gvx = px.scatter(
+                ps_plot, x="xg", y="goals",
+                color="xg", color_continuous_scale="RdYlGn",
+                hover_name="player",
+                hover_data={"primary_team": True, "xg": ":.2f",
+                            "goals": ":.0f", "diff": ":.2f",
+                            "games": True},
+                labels={"xg": "xG", "goals": "Goals",
+                        "diff": "Goals − xG", "primary_team": "Team"},
+                height=400,
             )
-            max_v = max(filtered["xg"].max(), filtered["goals"].max()) * 1.08
-            # y=x reference line — points above it are overperformers
-            ax.plot([0, max_v], [0, max_v], "w--", alpha=0.4, label="xG = Goals")
-            ax.set_xlabel("xG")
-            ax.set_ylabel("Goals")
-            ax.legend(fontsize=8, facecolor="#1a1a1a", labelcolor="white")
-            ax.grid(alpha=0.25)
-            for _, p in filtered.nlargest(6, "xg").iterrows():
-                ax.annotate(p["player"], (p["xg"], p["goals"]),
-                           fontsize=7, color="white",
-                           xytext=(4, 4), textcoords="offset points")
-            plt.colorbar(sc, ax=ax, label="xG")
-            dark_fig_style(fig, ax)
-            plt.tight_layout()
-            st.pyplot(fig)
+            fig_gvx.add_shape(type="line", x0=0, y0=0, x1=lim, y1=lim,
+                              line=dict(color="rgba(255,255,255,0.4)", width=1.5, dash="dot"))
+            fig_gvx.update_traces(marker=dict(size=7, line=dict(width=0.4, color="white")))
+            fig_gvx.update_layout(
+                paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+                font=dict(color="white"), coloraxis_showscale=False,
+                xaxis=dict(gridcolor="#333", range=[0, lim]),
+                yaxis=dict(gridcolor="#333", range=[0, lim]),
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_gvx, use_container_width=True)
 
     with c2:
-        # ── Top 15 by xG bar chart ────────────────────────────────────────────
-        # nlargest(15, "xg") selects the 15 players with the highest season xG.
-        # invert_yaxis() puts the highest xG player at the top of the chart.
         st.subheader("Top 15 by xG")
         if "xg" in filtered.columns:
-            top15 = filtered.nlargest(15, "xg")
-            fig, ax = plt.subplots(figsize=(6, 5))
-            ax.barh(top15["player"], top15["xg"], color=PURPLE)
-            ax.set_xlabel("xG")
-            ax.invert_yaxis()
-            ax.grid(axis="x", alpha=0.3)
-            dark_fig_style(fig, ax)
-            plt.tight_layout()
-            st.pyplot(fig)
+            top15 = filtered.nlargest(15, "xg").copy()
+            top15["xg"] = pd.to_numeric(top15["xg"], errors="coerce").round(2)
+            hover_cols = {c: True for c in ["primary_team", "goals", "games"] if c in top15.columns}
+            hover_cols["xg"] = ":.2f"
+            fig_top = px.bar(
+                top15.sort_values("xg"), x="xg", y="player", orientation="h",
+                color="xg", color_continuous_scale=[[0, PURPLE], [1, GREEN]],
+                hover_name="player",
+                hover_data=hover_cols,
+                labels={"xg": "xG", "player": ""},
+                height=420,
+            )
+            fig_top.update_layout(
+                paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+                font=dict(color="white"), coloraxis_showscale=False,
+                xaxis=dict(gridcolor="#333", title="xG"),
+                yaxis=dict(title="", tickfont=dict(size=10)),
+                margin=dict(t=10, b=10),
+            )
+            fig_top.update_traces(marker_line_width=0)
+            st.plotly_chart(fig_top, use_container_width=True)
 
-    # ── Assists vs xA scatter ─────────────────────────────────────────────────
-    # Same concept as the Goals vs xG chart but for chance creation.
-    # xA (expected assists) measures the quality of passes that led to shots.
-    # Players above the diagonal are converting their key passes into assists
-    # at a higher rate than the model predicts.
     if {"assists", "xa"}.issubset(filtered.columns) and len(filtered) > 1:
         st.markdown("---")
         st.subheader("Assists vs xA")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        sc = ax.scatter(filtered["xa"], filtered["assists"],
-                       s=60, alpha=0.75, c=filtered["xa"], cmap="Blues",
-                       edgecolors="white", linewidths=0.4)
-        max_v = max(filtered["xa"].max(), filtered["assists"].max()) * 1.08
-        ax.plot([0, max_v], [0, max_v], "w--", alpha=0.4, label="xA = Assists")
-        ax.set_xlabel("xA")
-        ax.set_ylabel("Assists")
-        ax.legend(fontsize=8, facecolor="#1a1a1a", labelcolor="white")
-        ax.grid(alpha=0.25)
-        for _, p in filtered.nlargest(5, "xa").iterrows():
-            ax.annotate(p["player"], (p["xa"], p["assists"]),
-                       fontsize=7, color="white",
-                       xytext=(4, 4), textcoords="offset points")
-        plt.colorbar(sc, ax=ax, label="xA")
-        dark_fig_style(fig, ax)
-        plt.tight_layout()
-        st.pyplot(fig)
+        xa_plot = filtered.copy()
+        for col in ("xa", "assists"):
+            xa_plot[col] = pd.to_numeric(xa_plot[col], errors="coerce")
+        xa_plot = xa_plot.dropna(subset=["xa", "assists"])
+        xa_plot["diff"] = (xa_plot["assists"] - xa_plot["xa"]).round(2)
+        xa_plot["xa"]      = xa_plot["xa"].round(2)
+        xa_plot["assists"] = xa_plot["assists"].round(2)
+        lim_xa = max(xa_plot["xa"].max(), xa_plot["assists"].max()) * 1.08
+        fig_xavs = px.scatter(
+            xa_plot, x="xa", y="assists",
+            color="xa", color_continuous_scale="Blues",
+            hover_name="player",
+            hover_data={"primary_team": True, "xa": ":.2f",
+                        "assists": ":.0f", "diff": ":.2f", "games": True},
+            labels={"xa": "xA", "assists": "Assists",
+                    "diff": "Assists − xA", "primary_team": "Team"},
+            height=380,
+        )
+        fig_xavs.add_shape(type="line", x0=0, y0=0, x1=lim_xa, y1=lim_xa,
+                           line=dict(color="rgba(255,255,255,0.4)", width=1.5, dash="dot"))
+        fig_xavs.update_traces(marker=dict(size=7, line=dict(width=0.4, color="white")))
+        fig_xavs.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+            font=dict(color="white"), coloraxis_showscale=False,
+            xaxis=dict(gridcolor="#333", range=[0, lim_xa]),
+            yaxis=dict(gridcolor="#333", range=[0, lim_xa]),
+            margin=dict(t=10, b=10),
+        )
+        st.plotly_chart(fig_xavs, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1167,128 +1385,282 @@ elif view == "👤 Player Stats":
 # G − xG = actual goals minus xG  (positive = overperforming the model)
 
 elif view == "📈 xG Analysis":
-    st.title("📈 Team xG Analysis")
+    st.title("📈 xG Analysis")
 
     ms = S["match_summary"]
+    ps = S["player_season"].copy()
     needed = {"home_team", "away_team", "home_xg", "away_xg", "home_goals", "away_goals"}
     if ms.empty or not needed.issubset(ms.columns):
         st.warning("Match summary data is incomplete — re-run `build_processed.py`.")
         st.stop()
 
-    # ── Build team-level aggregates ────────────────────────────────────────────
-    # match_summary has one row per match with home_ and away_ prefixed columns.
-    # To get per-team totals we need to handle each team's home AND away games.
-    # We do this by splitting the table into four views and summing by team.
+    # ── Build team-level season aggregates ────────────────────────────────────
+    flat = _flatten_ms(ms).dropna(subset=["xg_for", "xg_against", "goals_for", "goals_against"])
+    agg = flat.groupby("team")[["xg_for", "xg_against", "goals_for", "goals_against"]].sum().reset_index()
+    agg = agg[agg["xg_for"] > 0].copy()
+    agg["xgd"]          = agg["xg_for"]    - agg["xg_against"]
+    agg["attack_diff"]  = agg["goals_for"] - agg["xg_for"]
+    agg["defense_diff"] = agg["xg_against"] - agg["goals_against"]
+    agg = agg.sort_values("xg_for", ascending=False).reset_index(drop=True)
 
-    # Each team's xG when they were the home side
-    home_for  = ms[["home_team", "home_xg",  "home_goals"]].rename(
-        columns={"home_team": "team", "home_xg": "xgf", "home_goals": "gf"})
-    # Each team's xG when they were the away side
-    away_for  = ms[["away_team", "away_xg",  "away_goals"]].rename(
-        columns={"away_team": "team", "away_xg": "xgf", "away_goals": "gf"})
-    # xG conceded as the home team = the away team's xG
-    home_agst = ms[["home_team", "away_xg",  "away_goals"]].rename(
-        columns={"home_team": "team", "away_xg": "xga", "away_goals": "ga"})
-    # xG conceded as the away team = the home team's xG
-    away_agst = ms[["away_team", "home_xg",  "home_goals"]].rename(
-        columns={"away_team": "team", "home_xg": "xga", "home_goals": "ga"})
+    tab_team, tab_player = st.tabs(["🏟️ Team xG", "👤 Player xG"])
 
-    # Stack home+away rows and group by team to sum across the full season.
-    agg = (
-        pd.concat([home_for, away_for]).groupby("team")[["xgf", "gf"]].sum()
-        .join(pd.concat([home_agst, away_agst]).groupby("team")[["xga", "ga"]].sum())
-        .reset_index()
-    )
-    agg["xgd"]        = agg["xgf"] - agg["xga"]     # net expected goal difference
-    agg["g_minus_xg"] = agg["gf"]  - agg["xgf"]     # goals scored above/below model
-    agg = agg.sort_values("xgf", ascending=False).reset_index(drop=True)
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_team:
 
-    # ── Summary table ─────────────────────────────────────────────────────────
-    st.subheader("Team xG Table")
-    st.dataframe(
-        agg.rename(columns={"xgf": "xGF", "gf": "GF", "xga": "xGA",
-                             "ga": "GA", "xgd": "xGD", "g_minus_xg": "G − xG"})
-        .round(2),
-        use_container_width=True, hide_index=True,
-    )
+        # ── xGF vs xGA interactive scatter ────────────────────────────────
+        # Quadrant chart: top-right = dominant, bottom-left = defensive,
+        # top-left = struggling, bottom-right = open/exciting.
+        # Colour encodes xGD (green = positive, red = negative).
+        # Hover tooltip shows full stats per team.
+        st.subheader("xG For vs xG Against")
+        st.caption("Hover over a point to see team stats  ·  Dashed lines = league average  ·  Y-axis inverted: low xGA (good defence) floats to the top")
 
-    c1, c2 = st.columns(2)
+        avg_xgf = agg["xg_for"].mean()
+        avg_xga = agg["xg_against"].mean()
 
-    with c1:
-        # ── xGF vs xGA scatter ────────────────────────────────────────────────
-        # The four quadrants tell different stories:
-        #   Top-right:    High xGF, high xGA — exciting but open teams
-        #   Top-left:     Low xGF, high xGA  — struggling teams
-        #   Bottom-right: High xGF, low xGA  — dominant teams (top of table)
-        #   Bottom-left:  Low xGF, low xGA   — cautious / defensive teams
-        #
-        # Y-axis is inverted so low xGA (good defence) appears at the TOP,
-        # meaning the best teams naturally float to the top-right corner.
-        # Dashed cross-hairs mark the league average for both axes.
-        # Dot colour encodes xGD: green=positive, red=negative.
-        st.subheader("xGF vs xGA")
-        fig, ax = plt.subplots(figsize=(6, 6))
-        sc = ax.scatter(
-            agg["xgf"], agg["xga"],
-            s=90, alpha=0.85,
-            c=agg["xgd"], cmap="RdYlGn",
-            edgecolors="white", linewidths=0.5,
+        fig_scatter = px.scatter(
+            agg.round(2),
+            x="xg_for", y="xg_against",
+            color="xgd",
+            color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
+            text="team",
+            hover_name="team",
+            hover_data={
+                "xg_for":       ":.2f",
+                "xg_against":   ":.2f",
+                "goals_for":    ":.0f",
+                "goals_against":":.0f",
+                "xgd":          ":.2f",
+                "attack_diff":  ":.2f",
+                "defense_diff": ":.2f",
+                "team":         False,
+            },
+            labels={
+                "xg_for":       "xG For",
+                "xg_against":   "xG Against",
+                "xgd":          "xGD",
+                "goals_for":    "Goals",
+                "goals_against":"Goals Against",
+                "attack_diff":  "Atk Over/Under",
+                "defense_diff": "Def Over/Under",
+            },
+            height=550,
         )
-        # League-average reference lines
-        ax.axhline(agg["xga"].mean(), color="white", linestyle="--", alpha=0.35, lw=1)
-        ax.axvline(agg["xgf"].mean(), color="white", linestyle="--", alpha=0.35, lw=1)
-        ax.invert_yaxis()   # lower xGA = better defence → appears at top
-        ax.set_xlabel("xG For")
-        ax.set_ylabel("xG Against  (lower = better ↑)")
-        ax.grid(alpha=0.25)
-        for _, r in agg.iterrows():
-            ax.annotate(r["team"], (r["xgf"], r["xga"]),
-                       fontsize=7, color="white",
-                       xytext=(4, 4), textcoords="offset points")
-        plt.colorbar(sc, ax=ax, label="xGD")
-        dark_fig_style(fig, ax)
-        plt.tight_layout()
-        st.pyplot(fig)
+        fig_scatter.update_traces(
+            textposition="top center",
+            textfont=dict(size=10, color="white"),
+            marker=dict(size=12, line=dict(width=1, color="white")),
+        )
+        fig_scatter.add_hline(y=avg_xga, line_dash="dot", line_color="rgba(255,255,255,0.35)", line_width=1)
+        fig_scatter.add_vline(x=avg_xgf, line_dash="dot", line_color="rgba(255,255,255,0.35)", line_width=1)
+        fig_scatter.update_yaxes(autorange="reversed")  # low xGA (good defence) at top
+        fig_scatter.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+            font=dict(color="white"),
+            coloraxis_colorbar=dict(title=dict(text="xGD", font=dict(color="white")), tickfont=dict(color="white")),
+            xaxis=dict(gridcolor="#333", zerolinecolor="#555"),
+            yaxis=dict(gridcolor="#333", zerolinecolor="#555"),
+            margin=dict(t=30, b=10),
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
-    with c2:
-        # ── Overperformance bar chart ─────────────────────────────────────────
-        # Shows Goals − xG for every team, sorted low to high.
-        # Green bars = scored more goals than the model expected (lucky or clinical).
-        # Red bars   = scored fewer goals than expected (unlucky or wasteful).
-        # This is one of the most useful charts for predicting regression —
-        # teams far into the green are likely to slow down, and vice versa.
-        st.subheader("Goals vs xG (Overperformance)")
-        agg_s = agg.sort_values("g_minus_xg")
-        colors = [GREEN if v >= 0 else "#ff4444" for v in agg_s["g_minus_xg"]]
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.barh(agg_s["team"], agg_s["g_minus_xg"], color=colors, alpha=0.88)
-        ax.axvline(0, color="white", linewidth=1)   # zero line = perfectly on xG
-        ax.set_xlabel("Goals − xG")
-        ax.grid(axis="x", alpha=0.3)
-        dark_fig_style(fig, ax)
-        plt.tight_layout()
-        st.pyplot(fig)
+        st.markdown("---")
 
-    # ── Grouped bar: xGF vs actual goals per team ─────────────────────────────
-    # Side-by-side bars let you quickly scan which teams over- or under-scored
-    # relative to their expected goals across the whole season.
-    # np.arange() creates evenly spaced x positions for the team labels.
-    # w=0.35 is the bar width; bars are offset by ±w/2 to sit next to each other.
-    st.markdown("---")
-    st.subheader("Expected vs Actual Goals — all teams")
-    fig, ax = plt.subplots(figsize=(12, 5))
-    x = np.arange(len(agg))
-    w = 0.35
-    ax.bar(x - w / 2, agg["xgf"], w, label="xGF",  color=PURPLE, alpha=0.85)
-    ax.bar(x + w / 2, agg["gf"],  w, label="Goals", color=GREEN,  alpha=0.85)
-    ax.set_xticks(x)
-    ax.set_xticklabels(agg["team"], rotation=45, ha="right", color="white")
-    ax.set_ylabel("Goals / xG")
-    ax.legend(facecolor="#1a1a1a", labelcolor="white")
-    ax.grid(axis="y", alpha=0.3)
-    dark_fig_style(fig, ax)
-    plt.tight_layout()
-    st.pyplot(fig)
+        # ── Over/underperformance bars ─────────────────────────────────────
+        col_atk, col_def = st.columns(2)
+
+        with col_atk:
+            st.subheader("Attacking Over/Underperformance")
+            st.caption("Goals − xG  ·  Green = scoring above model, Red = below")
+            atk = agg.sort_values("attack_diff", ascending=True).copy()
+            atk["perf"] = atk["attack_diff"].apply(lambda v: "Over" if v >= 0 else "Under")
+            fig_atk = px.bar(
+                atk, x="attack_diff", y="team",
+                orientation="h",
+                color="perf",
+                color_discrete_map={"Over": GREEN, "Under": "#e74c3c"},
+                hover_name="team",
+                hover_data={"attack_diff": ":.2f", "xg_for": ":.2f", "goals_for": ":.0f", "perf": False},
+                labels={"attack_diff": "Goals − xG", "team": "", "perf": "",
+                        "xg_for": "xGF", "goals_for": "GF"},
+                height=max(350, len(atk) * 25),
+            )
+            fig_atk.add_vline(x=0, line_color="white", line_dash="dash", line_width=1)
+            fig_atk.update_layout(
+                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                font=dict(color="white"), showlegend=False,
+                xaxis=dict(gridcolor="#333", zerolinecolor="#555"),
+                yaxis=dict(gridcolor="#333"),
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_atk, use_container_width=True)
+
+        with col_def:
+            st.subheader("Defensive Over/Underperformance")
+            st.caption("xGA − Goals Conceded  ·  Green = conceding less than model, Red = leaky")
+            dfn = agg.sort_values("defense_diff", ascending=True).copy()
+            dfn["perf"] = dfn["defense_diff"].apply(lambda v: "Over" if v >= 0 else "Under")
+            fig_def = px.bar(
+                dfn, x="defense_diff", y="team",
+                orientation="h",
+                color="perf",
+                color_discrete_map={"Over": GREEN, "Under": "#e74c3c"},
+                hover_name="team",
+                hover_data={"defense_diff": ":.2f", "xg_against": ":.2f", "goals_against": ":.0f", "perf": False},
+                labels={"defense_diff": "xGA − Goals Conceded", "team": "", "perf": "",
+                        "xg_against": "xGA", "goals_against": "GA"},
+                height=max(350, len(dfn) * 25),
+            )
+            fig_def.add_vline(x=0, line_color="white", line_dash="dash", line_width=1)
+            fig_def.update_layout(
+                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                font=dict(color="white"), showlegend=False,
+                xaxis=dict(gridcolor="#333", zerolinecolor="#555"),
+                yaxis=dict(gridcolor="#333"),
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_def, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Expected vs Actual Goals grouped bar ──────────────────────────
+        st.subheader("Expected vs Actual Goals — all teams")
+        agg_sorted = agg.sort_values("xg_for", ascending=False)
+        agg_melt = agg_sorted.melt(
+            id_vars=["team", "xg_against", "goals_against", "xgd", "attack_diff", "defense_diff"],
+            value_vars=["xg_for", "goals_for"],
+            var_name="metric", value_name="value",
+        )
+        agg_melt["metric"] = agg_melt["metric"].map({"xg_for": "xGF", "goals_for": "Goals"})
+        fig_bar = px.bar(
+            agg_melt, x="team", y="value", color="metric",
+            barmode="group",
+            color_discrete_map={"xGF": PURPLE, "Goals": GREEN},
+            hover_data={"value": ":.2f", "metric": False},
+            labels={"value": "Goals / xG", "team": "", "metric": ""},
+            height=420,
+        )
+        fig_bar.update_layout(
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font=dict(color="white"),
+            xaxis=dict(tickangle=-45, gridcolor="#333"),
+            yaxis=dict(gridcolor="#333"),
+            legend=dict(bgcolor="#1a1a1a", font=dict(color="white")),
+            margin=dict(t=10, b=80),
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Summary table ─────────────────────────────────────────────────
+        st.subheader("Full Team Summary")
+        st.dataframe(
+            agg.rename(columns={
+                "xg_for":       "xGF",
+                "goals_for":    "GF",
+                "xg_against":   "xGA",
+                "goals_against":"GA",
+                "xgd":          "xGD",
+                "attack_diff":  "Atk Over/Under",
+                "defense_diff": "Def Over/Under",
+            }).sort_values("xGD", ascending=False).round(2),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_player:
+        if ps.empty:
+            st.warning("No player season data for this season.")
+            st.stop()
+
+        needed_ps = {"player", "team", "games", "npxg", "npg"}
+        if not needed_ps.issubset(ps.columns):
+            st.warning(f"player_season missing columns: {needed_ps - set(ps.columns)}")
+            st.stop()
+
+        ps_f = ps.copy()
+        for col in ("games", "npxg", "npg"):
+            ps_f[col] = pd.to_numeric(ps_f[col], errors="coerce").fillna(0)
+        ps_f = ps_f[ps_f["games"] >= 3]
+        if "position" in ps_f.columns:
+            ps_f = ps_f[~ps_f["position"].astype(str).str.contains("GK", na=False)]
+        if ps_f.empty:
+            st.warning("No qualifying players (≥ 3 games, non-GK) found.")
+            st.stop()
+
+        ps_f["diff"] = (ps_f["npg"] - ps_f["npxg"]).round(2)
+        ps_f["npxg"] = ps_f["npxg"].round(2)
+        ps_f["npg"]  = ps_f["npg"].round(2)
+
+        # ── Interactive scatter with hover tooltips ────────────────────────
+        st.subheader("Non-Penalty Goals vs npxG")
+        st.caption("Hover over a point to see player details  ·  Above the line = scoring more than expected")
+
+        lim_max = max(ps_f["npxg"].max(), ps_f["npg"].max()) * 1.08
+        lim_max = max(float(lim_max), 1.0)
+
+        fig_ps = px.scatter(
+            ps_f,
+            x="npxg", y="npg",
+            color="team",
+            hover_name="player",
+            hover_data={
+                "team":  True,
+                "npxg":  ":.2f",
+                "npg":   ":.2f",
+                "diff":  ":.2f",
+                "games": ":.0f",
+            },
+            labels={
+                "npxg": "Non-Penalty xG",
+                "npg":  "Non-Penalty Goals",
+                "diff": "Goals − npxG",
+                "games":"Games",
+            },
+            height=580,
+            opacity=0.82,
+        )
+        # y = x reference line
+        fig_ps.add_shape(
+            type="line", x0=0, y0=0, x1=lim_max, y1=lim_max,
+            line=dict(color="rgba(255,255,255,0.5)", width=1.5, dash="dot"),
+        )
+        fig_ps.add_annotation(
+            x=lim_max * 0.72, y=lim_max * 0.93,
+            text="Clinical ▲", showarrow=False,
+            font=dict(color="rgba(255,255,255,0.55)", size=10),
+        )
+        fig_ps.add_annotation(
+            x=lim_max * 0.68, y=lim_max * 0.07,
+            text="Wasteful ▼", showarrow=False,
+            font=dict(color="rgba(255,255,255,0.55)", size=10),
+        )
+        fig_ps.update_traces(marker=dict(size=8, line=dict(width=0.5, color="white")))
+        fig_ps.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#121212",
+            font=dict(color="white"),
+            xaxis=dict(range=[0, lim_max], gridcolor="#333", zerolinecolor="#555"),
+            yaxis=dict(range=[0, lim_max], gridcolor="#333", zerolinecolor="#555"),
+            legend=dict(bgcolor="rgba(30,30,30,0.8)", bordercolor="#555",
+                        font=dict(size=9), title_font=dict(size=10)),
+            margin=dict(t=30, b=10),
+        )
+        st.plotly_chart(fig_ps, use_container_width=True)
+
+        # ── Top 5 over / underperformers ──────────────────────────────────
+        col_ov, col_un = st.columns(2)
+        over  = ps_f.nlargest(5,  "diff")[["player", "team", "npxg", "npg", "diff"]]
+        under = ps_f.nsmallest(5, "diff")[["player", "team", "npxg", "npg", "diff"]]
+        with col_ov:
+            st.subheader("Top 5 Overperformers")
+            st.dataframe(over.rename(columns={"diff": "Goals − npxG"}),
+                         use_container_width=True, hide_index=True)
+        with col_un:
+            st.subheader("Top 5 Underperformers")
+            st.dataframe(under.rename(columns={"diff": "Goals − npxG"}),
+                         use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1395,49 +1767,66 @@ elif view == "🏅 Team Grades":
         team_rolling = team_rolling.sort_values("match_date").reset_index(drop=True)
         team_rolling["gw"] = range(1, len(team_rolling) + 1)   # gameweek number
 
-        fig, ax = plt.subplots(figsize=(12, 4))
+        fig_form = go.Figure()
 
-        # Plot the four sub-grade lines
         grade_lines = [
-            ("roll_overall_grade",  "⭐ Overall",  "#ffffff", 2.5),
-            ("roll_attack_grade",   "⚔️ Attack",   "#00ff85", 1.5),
-            ("roll_defense_grade",  "🛡️ Defense",  "#4da6ff", 1.5),
-            ("roll_style_grade",    "🎨 Style",    "#ffd700", 1.2),
+            ("roll_overall_grade", "⭐ Overall",  "#ffffff", 2.5),
+            ("roll_attack_grade",  "⚔️ Attack",   "#00ff85", 1.5),
+            ("roll_defense_grade", "🛡️ Defense",  "#4da6ff", 1.5),
+            ("roll_style_grade",   "🎨 Style",    "#ffd700", 1.2),
         ]
+        has_result = "result" in team_rolling.columns
         for col, lbl, color, lw in grade_lines:
             if col in team_rolling.columns:
-                ax.plot(team_rolling["gw"], team_rolling[col],
-                        label=lbl, color=color, linewidth=lw, marker="o",
-                        markersize=3, alpha=0.9)
+                cdata = (
+                    list(zip(team_rolling["result"], team_rolling[col]))
+                    if has_result
+                    else list(zip([""] * len(team_rolling), team_rolling[col]))
+                )
+                fig_form.add_trace(go.Scatter(
+                    x=team_rolling["gw"],
+                    y=team_rolling[col],
+                    mode="lines+markers",
+                    name=lbl,
+                    line=dict(color=color, width=lw),
+                    marker=dict(size=5),
+                    customdata=cdata,
+                    hovertemplate=(
+                        f"<b>{lbl}</b><br>"
+                        "GW: %{x}<br>"
+                        "Grade: %{customdata[1]:.2f}<br>"
+                        "Result: %{customdata[0]}<extra></extra>"
+                    ),
+                ))
 
-        # Shade background green (good form) / red (poor form) zones
-        ax.axhspan(7, 10, alpha=0.06, color="#00c853")
-        ax.axhspan(1,  4, alpha=0.06, color="#ff1744")
-        ax.axhline(5.5, color="white", linewidth=0.5, linestyle="--", alpha=0.3)
+        fig_form.add_hrect(y0=7, y1=10, fillcolor="#00c853", opacity=0.06, line_width=0)
+        fig_form.add_hrect(y0=1, y1=4,  fillcolor="#ff1744", opacity=0.06, line_width=0)
+        fig_form.add_hline(y=5.5, line_color="white", line_dash="dash",
+                           line_width=0.5, opacity=0.3)
 
-        ax.set_xlim(1, len(team_rolling))
-        ax.set_ylim(1, 10)
-        ax.set_xlabel("Gameweek", color="white")
-        ax.set_ylabel("Grade (1–10)", color="white")
-        ax.set_title(
-            f"Rolling 5-match form — {sel_gt}",
-            color="white", fontsize=12
+        if has_result:
+            result_colors = {"W": "#00c853", "D": "#ffd700", "L": "#ff1744"}
+            for _, rrow in team_rolling.iterrows():
+                res = rrow.get("result", "")
+                if res in result_colors:
+                    fig_form.add_annotation(
+                        x=rrow["gw"], y=1.2, text=f"<b>{res}</b>",
+                        showarrow=False,
+                        font=dict(color=result_colors[res], size=9),
+                        yref="y",
+                    )
+
+        fig_form.update_layout(
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font=dict(color="white"),
+            xaxis=dict(title="Gameweek", gridcolor="#333",
+                       range=[1, len(team_rolling)]),
+            yaxis=dict(title="Grade (1–10)", gridcolor="#333", range=[1, 10]),
+            legend=dict(bgcolor="#1a1a1a", font=dict(color="white")),
+            height=380,
+            margin=dict(t=20, b=20),
         )
-        ax.legend(facecolor="#1a1a1a", labelcolor="white", fontsize=9,
-                  loc="upper left")
-        ax.grid(alpha=0.2)
-
-        # Annotate W/D/L results above the x-axis
-        result_colors = {"W": "#00c853", "D": "#ffd700", "L": "#ff1744"}
-        for _, row in team_rolling.iterrows():
-            res = row.get("result", "")
-            if res in result_colors:
-                ax.text(row["gw"], 1.15, res, ha="center", va="bottom",
-                        fontsize=7, color=result_colors[res], fontweight="bold")
-
-        dark_fig_style(fig, ax)
-        plt.tight_layout()
-        st.pyplot(fig)
+        st.plotly_chart(fig_form, use_container_width=True)
     else:
         st.info("Not enough rolling data for this team / season.")
 
@@ -1569,22 +1958,43 @@ elif view == "⭐ Player Grades":
 
     with c1:
         st.subheader("Top 15 by Overall Grade")
-        top15 = pgf.nlargest(15, "overall_grade")
+        top15 = pgf.nlargest(15, "overall_grade").copy()
         if not top15.empty:
-            fig, ax = plt.subplots(figsize=(6, 5))
-            colors_bar = [
-                "#00c853" if g >= 7 else ("#ffd600" if g >= 4.5 else "#ff1744")
-                for g in top15["overall_grade"]
-            ]
-            ax.barh(top15["player"], top15["overall_grade"], color=colors_bar, alpha=0.9)
-            ax.set_xlabel("Overall Grade (1–10)")
-            ax.set_xlim(1, 10)
-            ax.invert_yaxis()
-            ax.axvline(5.5, color="white", linestyle="--", alpha=0.3, lw=1)
-            ax.grid(axis="x", alpha=0.25)
-            dark_fig_style(fig, ax)
-            plt.tight_layout()
-            st.pyplot(fig)
+            top15["grade_band"] = top15["overall_grade"].apply(
+                lambda g: "Elite (7+)" if g >= 7 else ("Average (4.5–7)" if g >= 4.5 else "Below (< 4.5)")
+            )
+            hover_t15 = {"overall_grade": ":.2f", "grade_band": False}
+            for col in ["team", "pos_group", "attack_grade", "creativity_grade", "defensive_grade"]:
+                if col in top15.columns:
+                    hover_t15[col] = True
+            fig_pg_bar = px.bar(
+                top15.sort_values("overall_grade", ascending=True),
+                x="overall_grade", y="player",
+                orientation="h",
+                color="grade_band",
+                color_discrete_map={
+                    "Elite (7+)": "#00c853",
+                    "Average (4.5–7)": "#ffd600",
+                    "Below (< 4.5)": "#ff1744",
+                },
+                hover_name="player",
+                hover_data=hover_t15,
+                labels={"overall_grade": "Overall Grade (1–10)", "player": "",
+                        "pos_group": "Pos", "team": "Team",
+                        "attack_grade": "Attack", "creativity_grade": "Creativity",
+                        "defensive_grade": "Defense"},
+                height=460,
+            )
+            fig_pg_bar.add_vline(x=5.5, line_color="white", line_dash="dash",
+                                 line_width=1, opacity=0.3)
+            fig_pg_bar.update_layout(
+                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                font=dict(color="white"), showlegend=False,
+                xaxis=dict(range=[1, 10], gridcolor="#333"),
+                yaxis=dict(gridcolor="#333"),
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_pg_bar, use_container_width=True)
 
     with c2:
         # ── Attack vs Defense scatter ─────────────────────────────────────────
@@ -1597,31 +2007,51 @@ elif view == "⭐ Player Grades":
             subset=["attack_grade", "defensive_grade"]
         )
         if len(outfield) > 2:
-            fig, ax = plt.subplots(figsize=(6, 5))
-            sc = ax.scatter(
-                outfield["attack_grade"], outfield["defensive_grade"],
-                c=outfield["overall_grade"], cmap="RdYlGn",
-                s=60, alpha=0.75, edgecolors="white", linewidths=0.4,
-                vmin=1, vmax=10,
+            hover_of = {
+                "team": True, "pos_group": True,
+                "attack_grade": ":.2f", "defensive_grade": ":.2f",
+                "overall_grade": ":.2f",
+            }
+            if "creativity_grade" in outfield.columns:
+                hover_of["creativity_grade"] = ":.2f"
+            fig_pg_sc = px.scatter(
+                outfield,
+                x="attack_grade", y="defensive_grade",
+                color="overall_grade",
+                color_continuous_scale="RdYlGn",
+                hover_name="player",
+                hover_data=hover_of,
+                labels={
+                    "attack_grade": "Attack Grade",
+                    "defensive_grade": "Defense Grade",
+                    "pos_group": "Position", "team": "Team",
+                    "overall_grade": "Overall",
+                    "creativity_grade": "Creativity",
+                },
+                range_x=[1, 10], range_y=[1, 10],
+                height=460,
+                opacity=0.82,
             )
-            ax.axhline(outfield["defensive_grade"].mean(), color="white",
-                       linestyle="--", alpha=0.3, lw=1)
-            ax.axvline(outfield["attack_grade"].mean(), color="white",
-                       linestyle="--", alpha=0.3, lw=1)
-            ax.set_xlabel("Attack Grade")
-            ax.set_ylabel("Defense Grade")
-            ax.set_xlim(1, 10)
-            ax.set_ylim(1, 10)
-            for _, p in outfield.nlargest(8, "overall_grade").iterrows():
-                ax.annotate(p["player"].split()[-1],
-                            (p["attack_grade"], p["defensive_grade"]),
-                            fontsize=7, color="white",
-                            xytext=(4, 4), textcoords="offset points")
-            plt.colorbar(sc, ax=ax, label="Overall Grade")
-            ax.grid(alpha=0.2)
-            dark_fig_style(fig, ax)
-            plt.tight_layout()
-            st.pyplot(fig)
+            fig_pg_sc.add_hline(
+                y=outfield["defensive_grade"].mean(),
+                line_color="white", line_dash="dash", line_width=1, opacity=0.3,
+            )
+            fig_pg_sc.add_vline(
+                x=outfield["attack_grade"].mean(),
+                line_color="white", line_dash="dash", line_width=1, opacity=0.3,
+            )
+            fig_pg_sc.update_layout(
+                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                font=dict(color="white"),
+                coloraxis_colorbar=dict(
+                    title=dict(text="Overall", font=dict(color="white")),
+                    tickfont=dict(color="white"),
+                ),
+                xaxis=dict(gridcolor="#333"),
+                yaxis=dict(gridcolor="#333"),
+                margin=dict(t=10, b=10),
+            )
+            st.plotly_chart(fig_pg_sc, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1774,6 +2204,7 @@ elif view == "🔮 Match Predictor":
         fig.patch.set_facecolor("#0e1117")
         plt.tight_layout()
         st.pyplot(fig)
+        plt.close(fig)
 
     else:
         st.info("Grade data not available for one or both teams.")
@@ -1804,6 +2235,410 @@ probabilities are summed over a 7×7 scoreline grid.
 | {away_team} attack | {poisson_model['team_attack'].get(away_team, 0.85):.3f} |
 | {away_team} defense | {poisson_model['team_defense'].get(away_team, 0.85):.3f} |
         """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚡  SHOT QUALITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif view == "⚡ Shot Quality":
+    st.title("⚡ Shot Quality")
+    st.markdown("Zone quality maps and team shot-quality rankings.")
+
+    shots_all = S["shots"].copy()
+    if shots_all.empty:
+        st.warning("No shot data available for this season.")
+        st.stop()
+
+    needed_sh = {"team", "x", "y", "xg", "result"}
+    missing_sh = needed_sh - set(shots_all.columns)
+    if missing_sh:
+        st.warning(f"shots data missing columns: {missing_sh}")
+        st.stop()
+
+    for col in ("x", "y", "xg"):
+        shots_all[col] = pd.to_numeric(shots_all[col], errors="coerce")
+    shots_all = shots_all.dropna(subset=["x", "y", "xg"])
+
+    all_teams = team_list(shots_all, "team")
+    if not all_teams:
+        st.warning("No teams found in shot data.")
+        st.stop()
+
+    # Controls
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([2, 1, 1])
+    with ctrl_col1:
+        sel_team = st.selectbox("Team:", all_teams)
+    with ctrl_col2:
+        side_filter = st.radio("Side:", ["All", "Home Only", "Away Only"])
+    with ctrl_col3:
+        show_opp = st.checkbox("Include opponent shots", value=False)
+
+    # Filter by team, then optionally by side using the `side` column that
+    # shots.csv already carries ("home" / "away") — no match_summary join needed.
+    team_shots = shots_all[shots_all["team"] == sel_team].copy()
+    if side_filter != "All" and "side" in team_shots.columns:
+        side_val = "home" if side_filter == "Home Only" else "away"
+        team_shots = team_shots[team_shots["side"] == side_val]
+
+    # shots_plot is always the team's own shots. When show_opp is requested,
+    # build a separate opp_shots frame used later for the second pitch map.
+    shots_plot = team_shots
+    opp_shots = pd.DataFrame()
+    if show_opp and "opponent" in shots_all.columns:
+        opp_shots = shots_all[shots_all["opponent"] == sel_team].copy()
+
+    if shots_plot.empty:
+        st.warning(f"No shots found for {sel_team} with current filters.")
+        st.stop()
+
+    n_shots = len(shots_plot)
+    avg_xg = shots_plot["xg"].mean()
+    goals = shots_plot[shots_plot["result"].str.lower() == "goal"]["xg"].count() if "result" in shots_plot.columns else 0
+    total_xg = shots_plot["xg"].sum()
+    xg_overperf = goals - total_xg
+
+    # Metrics row
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Shots", n_shots)
+    m2.metric("Goals", int(goals))
+    m3.metric("xG Total", f"{total_xg:.2f}")
+    m4.metric("Avg xG/Shot", f"{avg_xg:.3f}")
+    m5.metric("xG Overperf.", f"{xg_overperf:+.2f}")
+
+    # Half-pitch hexbin + scatter
+    pitch = VerticalPitch(
+        pitch_type="opta",
+        half=True,
+        pitch_color="#1a472a",
+        line_color="#aaaaaa",
+        linewidth=1.5,
+    )
+    fig_pitch, ax_pitch = pitch.draw(figsize=(8, 6))
+    fig_pitch.patch.set_facecolor("#0e1117")
+    ax_pitch.set_facecolor("#1a472a")
+
+    # Hexbin density background
+    if len(shots_plot) >= 3:
+        pitch.hexbin(
+            shots_plot["x"],
+            shots_plot["y"],
+            ax=ax_pitch,
+            gridsize=10,
+            cmap="YlOrRd",
+            zorder=2,
+            alpha=0.65,
+        )
+
+    # High-quality shots overlay (xg > 0.2)
+    hq = shots_plot[shots_plot["xg"] > 0.2].copy()
+    if not hq.empty:
+        is_goal = hq["result"].str.lower() == "goal" if "result" in hq.columns else pd.Series([False] * len(hq))
+        hq_colors = ["gold" if g else "white" for g in is_goal]
+        pitch.scatter(
+            hq["x"],
+            hq["y"],
+            ax=ax_pitch,
+            s=hq["xg"] * 600,
+            c=hq_colors,
+            edgecolors="#333333",
+            linewidth=0.5,
+            zorder=4,
+            alpha=0.9,
+        )
+
+    ax_pitch.set_title(
+        f"{sel_team} — Shot Quality Map ({n_shots} shots, avg xG: {avg_xg:.3f}/shot)",
+        color="white",
+        pad=10,
+    )
+
+    # Legend patches
+    patch_goal = mpatches.Patch(color="gold", label="Goal (xG > 0.2)")
+    patch_shot = mpatches.Patch(color="white", label="Shot (xG > 0.2)")
+    ax_pitch.legend(handles=[patch_goal, patch_shot], loc="lower left",
+                    facecolor="#1e1e1e", labelcolor="white", fontsize=8)
+
+    st.pyplot(fig_pitch)
+    plt.close(fig_pitch)
+
+    # If opponent shots visible, also plot them
+    if show_opp and "opponent" in shots_all.columns:
+        if not opp_shots.empty:
+            st.subheader(f"Shots Faced by {sel_team}")
+            pitch_opp = VerticalPitch(
+                pitch_type="opta", half=True,
+                pitch_color="#1a472a", line_color="#aaaaaa", linewidth=1.5,
+            )
+            fig_opp, ax_opp = pitch_opp.draw(figsize=(8, 6))
+            fig_opp.patch.set_facecolor("#0e1117")
+            ax_opp.set_facecolor("#1a472a")
+            if len(opp_shots) >= 3:
+                pitch_opp.hexbin(opp_shots["x"], opp_shots["y"], ax=ax_opp,
+                                 gridsize=10, cmap="Blues", zorder=2, alpha=0.65)
+            hq_opp = opp_shots[opp_shots["xg"] > 0.2].copy()
+            if not hq_opp.empty:
+                is_goal_opp = hq_opp["result"].str.lower() == "goal" if "result" in hq_opp.columns else pd.Series([False] * len(hq_opp))
+                pitch_opp.scatter(
+                    hq_opp["x"], hq_opp["y"], ax=ax_opp,
+                    s=hq_opp["xg"] * 600,
+                    c=["gold" if g else "#ff6b6b" for g in is_goal_opp],
+                    edgecolors="#333333", linewidth=0.5, zorder=4, alpha=0.9,
+                )
+            n_opp = len(opp_shots)
+            avg_xg_opp = opp_shots["xg"].mean()
+            ax_opp.set_title(
+                f"Shots Against {sel_team} ({n_opp} shots, avg xG: {avg_xg_opp:.3f}/shot)",
+                color="white", pad=10,
+            )
+            st.pyplot(fig_opp)
+            plt.close(fig_opp)
+
+    # Team ranking chart — avg xG per shot across all teams
+    st.subheader("Team Shot Quality Ranking (Avg xG/Shot)")
+    rank_df = (
+        shots_all.groupby("team")["xg"]
+        .agg(avg_xg_shot="mean", total_shots="count")
+        .reset_index()
+    )
+    rank_df = rank_df[rank_df["total_shots"] >= 10].sort_values("avg_xg_shot", ascending=True)
+
+    if not rank_df.empty:
+        rank_df = rank_df.copy()
+        rank_df["highlight"] = rank_df["team"].apply(
+            lambda t: "Selected" if t == sel_team else "Other"
+        )
+        fig_rank = px.bar(
+            rank_df, x="avg_xg_shot", y="team",
+            orientation="h",
+            color="highlight",
+            color_discrete_map={"Selected": GREEN, "Other": PURPLE},
+            hover_name="team",
+            hover_data={"avg_xg_shot": ":.4f", "total_shots": True, "highlight": False},
+            labels={"avg_xg_shot": "Avg xG per Shot", "team": "",
+                    "total_shots": "Total Shots", "highlight": ""},
+            title="Shot Quality — All Teams",
+            height=max(320, len(rank_df) * 25),
+        )
+        fig_rank.update_layout(
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font=dict(color="white"), showlegend=False,
+            xaxis=dict(gridcolor="#333"),
+            yaxis=dict(gridcolor="#333"),
+            title_font=dict(color="white"),
+            margin=dict(t=40, b=10),
+        )
+        st.plotly_chart(fig_rank, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚔️  HEAD-TO-HEAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif view == "⚔️ Head-to-Head":
+    st.title("⚔️ Head-to-Head")
+    st.markdown("Radar comparison, historical record, and key stats.")
+
+    ms = S["match_summary"].copy()
+    crossref_all = D["match_crossref"].copy()
+
+    if ms.empty:
+        st.warning("No match summary data for this season.")
+        st.stop()
+
+    all_teams_h2h = team_list(ms, "home_team", "away_team")
+    if len(all_teams_h2h) < 2:
+        st.warning("Not enough teams in match summary data.")
+        st.stop()
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        team_a = st.selectbox("Team A:", all_teams_h2h, index=0)
+    with col_b:
+        default_b_idx = 1 if (team_a == all_teams_h2h[0] and len(all_teams_h2h) > 1) else 0
+        team_b = st.selectbox("Team B:", all_teams_h2h, index=default_b_idx)
+
+    if team_a == team_b:
+        st.warning("Please select two different teams.")
+        st.stop()
+
+    # ── Build per-team averages from match_summary ────────────────────────────
+    team_stats_h2h = (
+        _flatten_ms(ms)
+        .groupby("team").mean(numeric_only=True).reset_index()
+    )
+
+    metric_cols = []
+    metric_labels = []
+    for col, label in [
+        ("xg_for", "xG For/Game"),
+        ("xg_against", "xGA/Game"),
+        ("possession_pct", "Possession %"),
+        ("pass_pct", "Pass Acc %"),
+        ("shot_pct", "Shot Acc %"),
+        ("tackle_pct", "Tackle Acc %"),
+    ]:
+        if col in team_stats_h2h.columns:
+            metric_cols.append(col)
+            metric_labels.append(label)
+
+    if len(metric_cols) < 3:
+        st.warning("Not enough metric columns in match_summary for radar chart.")
+        st.stop()
+
+    # Normalize 0-1 across all teams
+    norm_stats = team_stats_h2h.copy()
+    for col in metric_cols:
+        col_min = norm_stats[col].min()
+        col_max = norm_stats[col].max()
+        denom = col_max - col_min
+        if denom > 0:
+            norm_stats[col] = (norm_stats[col] - col_min) / denom
+        else:
+            norm_stats[col] = 0.5
+    # Invert xg_against: lower xGA normalized -> higher radar value (better defense)
+    if "xg_against" in metric_cols:
+        norm_stats["xg_against"] = 1 - norm_stats["xg_against"]
+
+    def _get_vals(team_name):
+        row = _team_row(norm_stats, team_name)
+        if row is None:
+            return [0.5] * len(metric_cols)
+        return [float(row.get(c, 0.5)) for c in metric_cols]
+
+    vals_a = _get_vals(team_a)
+    vals_b = _get_vals(team_b)
+
+    n_metrics = len(metric_cols)
+    angles = np.linspace(0, 2 * np.pi, n_metrics, endpoint=False).tolist()
+    # Close the polygon
+    vals_a_closed = vals_a + [vals_a[0]]
+    vals_b_closed = vals_b + [vals_b[0]]
+    angles_closed = angles + [angles[0]]
+
+    # ── Section 1: Radar ──────────────────────────────────────────────────────
+    st.subheader("Season Stats Radar")
+
+    # Pull raw (un-normalized) values for hover labels
+    row_a_raw = _team_row(team_stats_h2h, team_a)
+    row_b_raw = _team_row(team_stats_h2h, team_b)
+    raw_a = [round(float(row_a_raw[c]), 3) if row_a_raw is not None and c in row_a_raw.index else 0.0
+             for c in metric_cols]
+    raw_b = [round(float(row_b_raw[c]), 3) if row_b_raw is not None and c in row_b_raw.index else 0.0
+             for c in metric_cols]
+    # Close polygons for Plotly (repeat first element)
+    theta_closed = metric_labels + [metric_labels[0]]
+    raw_a_closed = raw_a + [raw_a[0]]
+    raw_b_closed = raw_b + [raw_b[0]]
+
+    fig_radar = go.Figure()
+    fig_radar.add_trace(go.Scatterpolar(
+        r=vals_a_closed,
+        theta=theta_closed,
+        fill="toself",
+        fillcolor="rgba(0,255,133,0.15)",
+        line=dict(color="#00ff85", width=2),
+        name=team_a,
+        customdata=[[v] for v in raw_a_closed],
+        hovertemplate=(
+            f"<b>{team_a}</b><br>"
+            "%{theta}: %{customdata[0]:.3f}<extra></extra>"
+        ),
+    ))
+    fig_radar.add_trace(go.Scatterpolar(
+        r=vals_b_closed,
+        theta=theta_closed,
+        fill="toself",
+        fillcolor="rgba(245,166,35,0.15)",
+        line=dict(color="#f5a623", width=2),
+        name=team_b,
+        customdata=[[v] for v in raw_b_closed],
+        hovertemplate=(
+            f"<b>{team_b}</b><br>"
+            "%{theta}: %{customdata[0]:.3f}<extra></extra>"
+        ),
+    ))
+    fig_radar.update_layout(
+        polar=dict(
+            bgcolor="#0e1117",
+            angularaxis=dict(
+                tickfont=dict(color="white", size=10),
+                linecolor="#444",
+                gridcolor="#333",
+            ),
+            radialaxis=dict(visible=False, range=[0, 1]),
+        ),
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font=dict(color="white"),
+        legend=dict(bgcolor="#1e1e1e", font=dict(color="white")),
+        title=dict(text=f"{team_a} vs {team_b}",
+                   font=dict(color="white", size=13)),
+        height=500,
+        margin=dict(t=60, b=20),
+    )
+    col_radar, col_spacer = st.columns([1, 1])
+    with col_radar:
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+    # ── Section 2: Direct H2H record ─────────────────────────────────────────
+    st.subheader("Head-to-Head Record")
+    if not crossref_all.empty and all(c in crossref_all.columns for c in
+                                       ["home_team", "away_team", "home_goals", "away_goals"]):
+        h2h_matches = crossref_all[
+            ((crossref_all["home_team"] == team_a) & (crossref_all["away_team"] == team_b)) |
+            ((crossref_all["home_team"] == team_b) & (crossref_all["away_team"] == team_a))
+        ].copy()
+        h2h_matches = h2h_matches.dropna(subset=["home_goals", "away_goals"])
+
+        if h2h_matches.empty:
+            st.info("No completed head-to-head matches found in the data.")
+        else:
+            h2h_matches = h2h_matches.sort_values("match_date", ascending=False)
+            h2h_matches["Date"] = pd.to_datetime(h2h_matches["match_date"], errors="coerce").dt.strftime("%d %b %Y")
+            h2h_matches["Home"] = h2h_matches["home_team"]
+            h2h_matches["Score"] = (
+                h2h_matches["home_goals"].astype(int).astype(str) + " – " +
+                h2h_matches["away_goals"].astype(int).astype(str)
+            )
+            h2h_matches["Away"] = h2h_matches["away_team"]
+            display_cols = ["Date", "Home", "Score", "Away"]
+            if "season" in h2h_matches.columns:
+                h2h_matches["Season"] = h2h_matches["season"]
+                display_cols.append("Season")
+            st.dataframe(h2h_matches[display_cols].reset_index(drop=True),
+                         use_container_width=True, hide_index=True)
+    else:
+        st.info("match_crossref data not available for H2H record.")
+
+    # ── Section 3: Key stats comparison table ─────────────────────────────────
+    st.subheader("Key Stats Comparison")
+
+    row_a = _team_row(team_stats_h2h, team_a)
+    row_b = _team_row(team_stats_h2h, team_b)
+    comparison_rows = []
+    for col, label in zip(metric_cols, metric_labels):
+        val_a = round(float(row_a[col]), 3) if row_a is not None and col in row_a.index else None
+        val_b = round(float(row_b[col]), 3) if row_b is not None and col in row_b.index else None
+        comparison_rows.append({"Metric": label, team_a: val_a, team_b: val_b})
+
+    comp_df = pd.DataFrame(comparison_rows)
+
+    def highlight_better(row):
+        val_a_r, val_b_r = row[team_a], row[team_b]
+        if val_a_r is None or val_b_r is None or val_a_r == val_b_r:
+            return [""] * len(row)
+        lower_better = "xGA" in row["Metric"]
+        a_wins = (val_a_r < val_b_r) if lower_better else (val_a_r > val_b_r)
+        win_color = "background-color: #1a3a2a"
+        result = [""] * len(row)
+        a_idx = comp_df.columns.get_loc(team_a)
+        b_idx = comp_df.columns.get_loc(team_b)
+        result[a_idx if a_wins else b_idx] = win_color
+        return result
+
+    styled_comp = comp_df.style.apply(highlight_better, axis=1)
+    st.dataframe(styled_comp, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

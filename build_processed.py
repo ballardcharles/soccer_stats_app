@@ -440,6 +440,16 @@ def main():
 
     print("\n✓ Done. All files saved to data/processed/")
 
+    # ── Build SQLite deployment database ──────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("Building soccer_stats.db ...")
+    try:
+        import build_db
+        build_db.main()
+    except Exception as exc:
+        print(f"  ⚠️  build_db failed: {exc}")
+        print("     Run 'python build_db.py' manually to retry.")
+
 
 if __name__ == "__main__":
     main()

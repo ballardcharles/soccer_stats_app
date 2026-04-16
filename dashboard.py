@@ -66,13 +66,135 @@ st.set_page_config(
     page_icon="⚽",
 )
 
-# Inject a small CSS block to set the dark background and style metric cards.
+# Responsive stylesheet — dark theme on all screen sizes, mobile-optimised
+# layout on phones (≤ 768 px), full wide layout on tablets and desktop.
 # unsafe_allow_html=True is required to pass raw HTML/CSS into Streamlit.
 st.markdown("""
 <style>
-    .main { background-color: #0e1117; }
-    h1, h2, h3 { color: #e8e8e8; }
-    .stMetric { background-color: #1e1e1e; padding: 10px; border-radius: 5px; }
+
+/* ── Base styles (all screen sizes) ───────────────────────────────────────── */
+.main { background-color: #0e1117; }
+h1, h2, h3 { color: #e8e8e8; }
+.stMetric { background-color: #1e1e1e; padding: 10px; border-radius: 5px; }
+
+/* ── Mobile  (≤ 768 px) ────────────────────────────────────────────────────
+   Goals:
+     • Remove excess horizontal padding so charts fill the screen
+     • Stack every multi-column row vertically
+     • Scale typography down slightly
+     • Make metric cards, dataframes, and tabs usable on a small screen
+     • Keep touch targets large enough to tap comfortably
+────────────────────────────────────────────────────────────────────────── */
+@media screen and (max-width: 768px) {
+
+    /* Give the main content breathing room but not so much it wastes space */
+    .block-container {
+        padding-left:  0.75rem !important;
+        padding-right: 0.75rem !important;
+        padding-top:   3rem   !important;   /* clear the hamburger button */
+        max-width:     100vw  !important;
+    }
+
+    /* Stack every column row vertically — covers all st.columns() calls */
+    [data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+    }
+    [data-testid="stColumn"] {
+        width:     100% !important;
+        flex:      1 1 100% !important;
+        min-width: 100% !important;
+    }
+
+    /* Typography: slightly smaller but still readable */
+    h1 { font-size: 1.4rem !important; line-height: 1.3 !important; }
+    h2 { font-size: 1.15rem !important; }
+    h3 { font-size: 1.0rem  !important; }
+    p  { font-size: 0.9rem  !important; }
+    small,
+    [data-testid="stCaptionContainer"] p {
+        font-size: 0.78rem !important;
+    }
+
+    /* Metric cards: tighter padding, smaller label, legible value */
+    [data-testid="metric-container"] {
+        padding: 0.4rem 0.6rem !important;
+    }
+    [data-testid="metric-container"] label {
+        font-size: 0.72rem !important;
+    }
+    [data-testid="metric-container"] [data-testid="stMetricValue"] {
+        font-size: 1.2rem !important;
+    }
+    [data-testid="metric-container"] [data-testid="stMetricDelta"] {
+        font-size: 0.72rem !important;
+    }
+
+    /* DataFrames: scroll horizontally rather than overflowing */
+    [data-testid="stDataFrame"] > div,
+    [data-testid="stDataFrameResizable"] > div {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+
+    /* Tabs: scroll horizontally if labels don't fit */
+    [data-testid="stTabs"] [role="tablist"] {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+        flex-wrap: nowrap !important;
+        scrollbar-width: none !important;
+    }
+    [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar {
+        display: none !important;
+    }
+    [data-testid="stTabs"] [role="tab"] {
+        white-space: nowrap !important;
+        font-size: 0.8rem !important;
+        padding: 0.3rem 0.6rem !important;
+    }
+
+    /* Horizontal radio buttons (e.g. Heatmap / Arrow Map toggle): wrap */
+    [data-testid="stRadio"] > div[role="radiogroup"] {
+        flex-wrap: wrap !important;
+        gap: 0.4rem !important;
+    }
+
+    /* Inputs: full width and easier to tap */
+    [data-testid="stSelectbox"],
+    [data-testid="stMultiSelect"],
+    [data-testid="stSlider"] {
+        width: 100% !important;
+    }
+
+    /* Buttons: easier tap target */
+    [data-testid="stButton"] button {
+        min-height: 2.25rem !important;
+        font-size: 0.85rem !important;
+    }
+
+    /* Charts: Plotly fills full column width */
+    .js-plotly-plot,
+    .js-plotly-plot .plotly {
+        width: 100% !important;
+    }
+
+    /* Dividers: tighter spacing */
+    hr { margin: 0.5rem 0 !important; }
+
+    /* Top decoration bar Streamlit adds — not useful on mobile */
+    [data-testid="stDecoration"] { display: none !important; }
+}
+
+/* ── Tablet  (769 px – 1024 px) ────────────────────────────────────────────
+   Mostly fine at this size — just trim padding so charts aren't cramped.
+   Columns do NOT stack; the wide layout is preserved.
+────────────────────────────────────────────────────────────────────────── */
+@media screen and (min-width: 769px) and (max-width: 1024px) {
+    .block-container {
+        padding-left:  1.5rem !important;
+        padding-right: 1.5rem !important;
+    }
+}
+
 </style>
 """, unsafe_allow_html=True)
 

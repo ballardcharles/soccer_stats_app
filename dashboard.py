@@ -95,7 +95,11 @@ PROCESSED = "data/processed"
 
 @st.cache_data
 def load_data() -> dict[str, pd.DataFrame]:
-    """Load all data tables into a single dictionary of DataFrames.
+    """Load all data tables except events into a single dictionary of DataFrames.
+
+    Events are intentionally excluded here — at 1 GB+ in RAM they would crash
+    Streamlit Cloud's 1 GB memory limit before the app renders a single chart.
+    Use load_events(season) instead wherever events are needed.
 
     Reads from soccer_stats.db (SQLite) if it exists, otherwise falls back
     to the individual CSVs in data/processed/.
@@ -103,7 +107,7 @@ def load_data() -> dict[str, pd.DataFrame]:
     import os, sqlite3
 
     def _parse_dates(dfs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-        for key in ("shots", "events", "match_summary", "lineups", "match_crossref"):
+        for key in ("shots", "match_summary", "lineups", "match_crossref"):
             df = dfs.get(key, pd.DataFrame())
             if "match_date" in df.columns:
                 df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
@@ -120,7 +124,7 @@ def load_data() -> dict[str, pd.DataFrame]:
 
         dfs = dict(
             shots         = _tbl("shots"),
-            events        = _tbl("events"),
+            events        = pd.DataFrame(),   # loaded lazily via load_events()
             match_summary = _tbl("match_summary"),
             match_crossref= _tbl("match_crossref"),
             player_season = _tbl("player_season"),
@@ -138,13 +142,51 @@ def load_data() -> dict[str, pd.DataFrame]:
 
     dfs = dict(
         shots         = safe_read("shots.csv"),
-        events        = safe_read("events.csv"),
+        events        = pd.DataFrame(),       # loaded lazily via load_events()
         match_summary = safe_read("match_summary.csv"),
         match_crossref= safe_read("match_crossref.csv"),
         player_season = safe_read("player_season.csv"),
         lineups       = safe_read("lineups.csv"),
     )
     return _parse_dates(dfs)
+
+
+@st.cache_data(show_spinner=False)
+def load_events(season: str) -> pd.DataFrame:
+    """Load events for a single season on demand (~350 MB vs 1 GB for all seasons).
+
+    Results are cached by season so switching views doesn't re-query the DB.
+    Uses a WHERE clause so SQLite only reads the relevant index range.
+    """
+    import os, sqlite3
+
+    if not season:
+        return pd.DataFrame()
+
+    # ── Primary path: SQLite ──────────────────────────────────────────────────
+    if os.path.exists(DB_PATH):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            df = pd.read_sql_query(
+                "SELECT * FROM events WHERE season = ?", conn, params=(season,)
+            )
+            conn.close()
+            if "match_date" in df.columns:
+                df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    # ── Fallback path: CSV ────────────────────────────────────────────────────
+    path = f"{PROCESSED}/events.csv"
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path, low_memory=False)
+    if "season" in df.columns:
+        df = df[df["season"] == season].copy()
+    if "match_date" in df.columns:
+        df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
+    return df
 
 
 # Show a spinner while data loads, then store everything in D.
@@ -815,9 +857,10 @@ elif view == "🎯 Shot Maps":
 elif view == "🔥 Event Heatmaps":
     st.title("🔥 Event Heatmaps")
 
-    events = S["events"]
+    with st.spinner("Loading events…"):
+        events = load_events(sel_season)
     if events.empty:
-        st.warning("No event data — run the WhoScored collector.")
+        st.warning("No event data for this season — run the WhoScored collector.")
         st.stop()
 
     # Build the list of available event types from whatever is in the data.
@@ -1882,7 +1925,7 @@ elif view == "⭐ Player Grades":
         st.stop()
 
     with st.spinner("Computing player grades…"):
-        pg = _get_player_grades(ps, D["events"], D["lineups"])
+        pg = _get_player_grades(ps, load_events(sel_season), D["lineups"])
 
     if pg.empty:
         st.warning("Could not compute player grades.")

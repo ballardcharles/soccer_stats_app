@@ -251,6 +251,7 @@ def load_data() -> dict[str, pd.DataFrame]:
             match_crossref= _tbl("match_crossref"),
             player_season = _tbl("player_season"),
             lineups       = _tbl("lineups"),
+            formations    = _tbl("formations"),
         )
         conn.close()
         return _parse_dates(dfs)
@@ -269,6 +270,7 @@ def load_data() -> dict[str, pd.DataFrame]:
         match_crossref= safe_read("match_crossref.csv"),
         player_season = safe_read("player_season.csv"),
         lineups       = safe_read("lineups.csv"),
+        formations    = pd.DataFrame(),        # only available from DB
     )
     return _parse_dates(dfs)
 
@@ -2939,10 +2941,12 @@ elif view == "🗺️ Tactics":
     # Colour scheme (consistent across all three tabs)
     pos_colors = {"GK": "#f1c40f", "DEF": "#3498db", "MID": "#2ecc71", "FWD": "#e74c3c"}
 
-    tab_pos, tab_net, tab_def = st.tabs([
+    tab_pos, tab_net, tab_def, tab_form, tab_sp = st.tabs([
         "📍 Average Positions",
         "🔗 Pass Network",
         "🛡️ Defensive Shape",
+        "🏟️ Formation",
+        "⚽ Set Pieces",
     ])
 
     # ══════════════════════════════════════════════════════════════════════
@@ -3229,6 +3233,347 @@ elif view == "🗺️ Tactics":
                 .sort_values("Total", ascending=False),
                 use_container_width=True, hide_index=True,
             )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tab 4 — Formation
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_form:
+        st.subheader(match_title)
+
+        formations_tac = D.get("formations", pd.DataFrame())
+
+        # ── Resolve formation for the selected match / season average ─────────
+        team_forms = pd.DataFrame()
+        if not formations_tac.empty and "team" in formations_tac.columns:
+            team_forms = formations_tac[formations_tac["team"] == sel_tac_team].copy()
+            if "season" in team_forms.columns:
+                team_forms = team_forms[team_forms["season"] == sel_season]
+
+        # Current selection
+        if sel_tac_match != "📅 Season Average" and not team_forms.empty:
+            # Match the selected match date to pick the formation
+            md_val = ev["match_date"].dropna().iloc[0] if not ev["match_date"].dropna().empty else None
+            match_form = pd.DataFrame()
+            if md_val is not None:
+                match_form = team_forms[
+                    pd.to_datetime(team_forms["match_date"], errors="coerce").dt.date
+                    == pd.to_datetime(md_val, errors="coerce").date()
+                ]
+            if not match_form.empty:
+                formation_str = match_form["formation"].iloc[0]
+                st.markdown(
+                    f"<h1 style='text-align:center;font-size:3rem;letter-spacing:0.15em;"
+                    f"color:#00ff85'>{formation_str}</h1>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<p style='text-align:center;color:#aaa'>"
+                    f"{sel_tac_team} vs {match_title.split('—')[-1].strip()} — "
+                    f"Formation from WhoScored data</p>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info("No WhoScored formation record for this match.")
+        elif sel_tac_match == "📅 Season Average" and not team_forms.empty:
+            st.info("Season-average mode shows formation history across all matches.")
+
+        # ── Season formation history table ────────────────────────────────────
+        if not team_forms.empty and "formation" in team_forms.columns:
+            st.markdown("### Formation history this season")
+
+            form_hist = team_forms.copy()
+            if "match_date" in form_hist.columns:
+                form_hist["match_date"] = pd.to_datetime(
+                    form_hist["match_date"], errors="coerce"
+                )
+                form_hist = form_hist.sort_values("match_date", ascending=False)
+
+            # Opponent column
+            if "home_team" in form_hist.columns and "away_team" in form_hist.columns:
+                form_hist["Opponent"] = form_hist.apply(
+                    lambda r: r["away_team"] if r["home_team"] == sel_tac_team
+                    else r["home_team"], axis=1
+                )
+                form_hist["H/A"] = form_hist.apply(
+                    lambda r: "H" if r["home_team"] == sel_tac_team else "A", axis=1
+                )
+
+            display_cols = {}
+            if "match_date" in form_hist.columns:
+                form_hist["Date"] = form_hist["match_date"].dt.strftime("%d %b %Y")
+                display_cols["Date"] = "Date"
+            if "Opponent" in form_hist.columns:
+                display_cols["Opponent"] = "Opponent"
+            if "H/A" in form_hist.columns:
+                display_cols["H/A"] = "H/A"
+            display_cols["formation"] = "Formation"
+
+            st.dataframe(
+                form_hist[[c for c in display_cols if c in form_hist.columns]]
+                .rename(columns={"formation": "Formation"}),
+                use_container_width=True, hide_index=True,
+            )
+
+            # Formation frequency bar chart
+            form_counts = (
+                team_forms["formation"].value_counts()
+                .reset_index()
+                .rename(columns={"index": "Formation", "formation": "Matches"})
+            )
+            # pandas ≥2.0 value_counts() returns different column names
+            if "count" in form_counts.columns:
+                form_counts = form_counts.rename(columns={"formation": "Formation", "count": "Matches"})
+
+            if len(form_counts) > 1:
+                st.markdown("### Formation usage")
+                fig_fc = px.bar(
+                    form_counts, x="Formation", y="Matches",
+                    color="Formation",
+                    text="Matches",
+                    title=f"{sel_tac_team} — {sel_season} formation usage",
+                    height=280,
+                )
+                fig_fc.update_layout(
+                    plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                    font=dict(color="white"), showlegend=False,
+                    xaxis=dict(gridcolor="#333"),
+                    yaxis=dict(gridcolor="#333"),
+                    margin=dict(t=40, b=10, l=10, r=10),
+                )
+                fig_fc.update_traces(
+                    hovertemplate="<b>%{x}</b><br>Matches: %{y}<extra></extra>",
+                    textposition="outside",
+                )
+                st.plotly_chart(fig_fc, use_container_width=True)
+        else:
+            st.info(
+                "Formation data comes from WhoScored events. "
+                "Rebuild the database (`python build_db.py`) to populate it."
+            )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tab 5 — Set Pieces
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_sp:
+        st.subheader(match_title)
+
+        # Split into corners vs free kicks
+        sp_corners = ev[
+            (ev.get("is_corner", pd.Series(0, index=ev.index)) == 1) |
+            (ev["type"] == "CornerAwarded")
+        ].copy() if "is_corner" in ev.columns else pd.DataFrame()
+
+        # Use is_corner flag if available (proper deliveries), else warn
+        if "is_corner" not in ev.columns:
+            st.warning(
+                "Set-piece flags not found in this database. "
+                "Re-run `python build_db.py` to add corner/free-kick flags."
+            )
+        else:
+            corners_ev  = ev[(ev["is_corner"]   == 1)].copy()
+            freekick_ev = ev[(ev["is_freekick"]  == 1)].copy()
+
+            sp_tab1, sp_tab2 = st.tabs(["🚩 Corners", "🎯 Free Kicks"])
+
+            # ── Corners ───────────────────────────────────────────────────────
+            with sp_tab1:
+                if corners_ev.empty:
+                    st.info("No corner deliveries for this selection.")
+                else:
+                    corners_ev = corners_ev.dropna(subset=["x", "y", "end_x", "end_y"])
+                    total_c    = len(corners_ev)
+                    succ_c     = (corners_ev["outcome_type"].fillna("").str.lower() == "successful").sum()
+                    # Corners from the left channel (y < 50 = bottom of pitch → right side
+                    # in opta coords) vs right channel (y > 50)
+                    left_c  = (corners_ev["y"] < 10).sum()   # near-left corner flag
+                    right_c = (corners_ev["y"] > 90).sum()   # near-right corner flag
+
+                    cm1, cm2, cm3, cm4 = st.columns(4)
+                    cm1.metric("Total corners", total_c)
+                    cm2.metric("Successful delivery", f"{succ_c}")
+                    cm3.metric("Completion %", f"{100*succ_c/total_c:.0f}%" if total_c else "—")
+                    cm4.metric("Left / Right", f"{left_c} / {right_c}")
+
+                    fig_c, ax_c = plt.subplots(figsize=(12, 7))
+                    pitch_c = Pitch(pitch_type="opta", pitch_color=PITCH_GREEN,
+                                    line_color="white", line_zorder=2)
+                    pitch_c.draw(ax=ax_c)
+
+                    # Draw delivery arrows: origin (corner flag) → landing zone
+                    for _, row in corners_ev.iterrows():
+                        succ = str(row.get("outcome_type", "")).lower() == "successful"
+                        color = "#00ff85" if succ else "#e74c3c"
+                        alpha = 0.55 if succ else 0.35
+                        ax_c.annotate(
+                            "", xy=(row["end_x"], row["end_y"]),
+                            xytext=(row["x"], row["y"]),
+                            arrowprops=dict(
+                                arrowstyle="->", color=color,
+                                lw=1.1, alpha=alpha,
+                            ),
+                            zorder=4,
+                        )
+
+                    # Shade penalty area as target zone
+                    ax_c.add_patch(plt.Rectangle(
+                        (83, 21.1), 17, 57.8, linewidth=0,
+                        edgecolor="none", facecolor="#ffffff", alpha=0.05, zorder=2,
+                    ))
+
+                    ax_c.set_title(f"Corner Deliveries — {match_title}",
+                                   color="white", fontsize=11, pad=10)
+                    from matplotlib.lines import Line2D
+                    legend_els_c = [
+                        Line2D([0], [0], color="#00ff85", lw=2, label="Successful"),
+                        Line2D([0], [0], color="#e74c3c", lw=2, label="Unsuccessful"),
+                    ]
+                    ax_c.legend(handles=legend_els_c, loc="upper left",
+                                facecolor="#1a1a1a", labelcolor="white", fontsize=8)
+                    dark_fig_style(fig_c, ax_c)
+                    plt.tight_layout()
+                    st.pyplot(fig_c)
+                    plt.close(fig_c)
+                    st.caption(
+                        "Green arrows = successful delivery · Red = unsuccessful. "
+                        "Shaded box = penalty area. "
+                        "Arrow origin = corner flag position."
+                    )
+
+                    # Landing zone breakdown (thirds of goal area width)
+                    if total_c >= 3:
+                        st.markdown("**Delivery zones (end position)**")
+                        near_post  = ((corners_ev["end_y"] < 37) | (corners_ev["end_y"] > 63)).sum()
+                        six_yard   = ((corners_ev["end_x"] > 94) & corners_ev["end_y"].between(21, 79)).sum()
+                        penalty    = ((corners_ev["end_x"].between(83, 94)) & corners_ev["end_y"].between(21, 79)).sum()
+                        zone_df = pd.DataFrame({
+                            "Zone":    ["Near/Far Post", "6-yard box", "Penalty area", "Other"],
+                            "Corners": [
+                                int(near_post), int(six_yard), int(penalty),
+                                int(total_c - near_post - six_yard - penalty),
+                            ],
+                        })
+                        zone_df["Corners"] = zone_df["Corners"].clip(lower=0)
+                        fig_cz = px.bar(
+                            zone_df, x="Corners", y="Zone", orientation="h",
+                            color="Zone",
+                            text="Corners",
+                            height=200,
+                        )
+                        fig_cz.update_layout(
+                            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                            font=dict(color="white"), showlegend=False,
+                            xaxis=dict(gridcolor="#333"),
+                            yaxis=dict(gridcolor="#333"),
+                            margin=dict(t=10, b=10, l=10, r=10),
+                        )
+                        fig_cz.update_traces(
+                            hovertemplate="<b>%{y}</b><br>Corners: %{x}<extra></extra>",
+                        )
+                        st.plotly_chart(fig_cz, use_container_width=True)
+
+            # ── Free Kicks ────────────────────────────────────────────────────
+            with sp_tab2:
+                if freekick_ev.empty:
+                    st.info("No free kick deliveries for this selection.")
+                else:
+                    freekick_ev = freekick_ev.dropna(subset=["x", "y", "end_x", "end_y"])
+                    total_fk    = len(freekick_ev)
+                    succ_fk     = (freekick_ev["outcome_type"].fillna("").str.lower() == "successful").sum()
+                    att_fk      = (freekick_ev["x"] >= 60).sum()   # attacking half FKs
+                    def_fk      = (freekick_ev["x"] < 40).sum()    # defensive FKs
+
+                    fm1, fm2, fm3, fm4 = st.columns(4)
+                    fm1.metric("Total FK deliveries", total_fk)
+                    fm2.metric("Completion %", f"{100*succ_fk/total_fk:.0f}%" if total_fk else "—")
+                    fm3.metric("In attacking half", att_fk)
+                    fm4.metric("In defensive half", def_fk)
+
+                    # Zone filter
+                    fk_zone = st.radio(
+                        "Show:", ["All", "Attacking half (x ≥ 60)", "Defensive half (x < 40)"],
+                        horizontal=True, key="fk_zone",
+                    )
+                    if fk_zone == "Attacking half (x ≥ 60)":
+                        fk_plot = freekick_ev[freekick_ev["x"] >= 60]
+                    elif fk_zone == "Defensive half (x < 40)":
+                        fk_plot = freekick_ev[freekick_ev["x"] < 40]
+                    else:
+                        fk_plot = freekick_ev
+
+                    fig_fk, ax_fk = plt.subplots(figsize=(12, 7))
+                    pitch_fk = Pitch(pitch_type="opta", pitch_color=PITCH_GREEN,
+                                     line_color="white", line_zorder=2)
+                    pitch_fk.draw(ax=ax_fk)
+
+                    for _, row in fk_plot.iterrows():
+                        succ  = str(row.get("outcome_type", "")).lower() == "successful"
+                        color = "#00ff85" if succ else "#e74c3c"
+                        alpha = 0.55 if succ else 0.35
+                        ax_fk.annotate(
+                            "", xy=(row["end_x"], row["end_y"]),
+                            xytext=(row["x"], row["y"]),
+                            arrowprops=dict(
+                                arrowstyle="->", color=color,
+                                lw=1.0, alpha=alpha,
+                            ),
+                            zorder=4,
+                        )
+                        # Mark origin point
+                        ax_fk.scatter(row["x"], row["y"], c=color,
+                                      s=18, alpha=0.7, zorder=5, edgecolors="none")
+
+                    # Shade the danger zone (penalty area, attacking end)
+                    ax_fk.add_patch(plt.Rectangle(
+                        (83, 21.1), 17, 57.8, linewidth=0,
+                        edgecolor="none", facecolor="#ffffff", alpha=0.05, zorder=2,
+                    ))
+
+                    ax_fk.set_title(f"Free Kick Deliveries — {match_title}",
+                                    color="white", fontsize=11, pad=10)
+                    ax_fk.legend(handles=legend_els_c, loc="upper left",
+                                 facecolor="#1a1a1a", labelcolor="white", fontsize=8)
+                    dark_fig_style(fig_fk, ax_fk)
+                    plt.tight_layout()
+                    st.pyplot(fig_fk)
+                    plt.close(fig_fk)
+                    st.caption(
+                        "Green arrows = successful delivery · Red = unsuccessful. "
+                        "Dot = FK origin. Arrow = delivery direction. "
+                        "Shaded box = penalty area."
+                    )
+
+                    # FK origin heatmap by pitch zone
+                    if total_fk >= 5:
+                        st.markdown("**Free kick origin zones**")
+                        fk_att3  = (freekick_ev["x"] >= 67).sum()
+                        fk_mid3  = ((freekick_ev["x"] >= 33) & (freekick_ev["x"] < 67)).sum()
+                        fk_def3  = (freekick_ev["x"] < 33).sum()
+                        fk_zones_df = pd.DataFrame({
+                            "Zone":      ["Attacking ⅓", "Middle ⅓", "Defensive ⅓"],
+                            "Free Kicks": [int(fk_att3), int(fk_mid3), int(fk_def3)],
+                        })
+                        fig_fkz = px.bar(
+                            fk_zones_df, x="Free Kicks", y="Zone", orientation="h",
+                            color="Zone",
+                            color_discrete_map={
+                                "Attacking ⅓": "#e74c3c",
+                                "Middle ⅓":    "#f39c12",
+                                "Defensive ⅓": "#3498db",
+                            },
+                            text="Free Kicks",
+                            height=200,
+                        )
+                        fig_fkz.update_layout(
+                            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                            font=dict(color="white"), showlegend=False,
+                            xaxis=dict(gridcolor="#333"),
+                            yaxis=dict(gridcolor="#333"),
+                            margin=dict(t=10, b=10, l=10, r=10),
+                        )
+                        fig_fkz.update_traces(
+                            hovertemplate="<b>%{y}</b><br>Free Kicks: %{x}<extra></extra>",
+                        )
+                        st.plotly_chart(fig_fkz, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

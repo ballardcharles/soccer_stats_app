@@ -161,15 +161,18 @@ def build_match_crossref(data: dict, us_season: int) -> pd.DataFrame:
             columns={"game_id": "whoscored_game_id"}
         )
 
-    # Join
+    # Join — deduplicate keys first to prevent row-multiplication if a source
+    # contains duplicate fixtures (e.g. rescheduled matches or re-scrape artefacts)
     crossref = us_key.copy()
     if not espn_key.empty:
+        espn_key = espn_key.drop_duplicates(["match_date", "home_team", "away_team"])
         crossref = crossref.merge(espn_key, on=["match_date", "home_team", "away_team"], how="left")
     else:
         crossref["espn_game_id"]  = pd.NA
         crossref["espn_game_str"] = pd.NA
 
     if not ws_key.empty:
+        ws_key = ws_key.drop_duplicates(["match_date", "home_team", "away_team"])
         crossref = crossref.merge(ws_key, on=["match_date", "home_team", "away_team"], how="left")
     else:
         crossref["whoscored_game_id"] = pd.NA
@@ -447,8 +450,9 @@ def main():
         import build_db
         build_db.main()
     except Exception as exc:
-        print(f"  ⚠️  build_db failed: {exc}")
-        print("     Run 'python build_db.py' manually to retry.")
+        print(f"  ❌  build_db failed: {exc}")
+        print("     Processed CSVs were saved but soccer_stats.db was NOT updated.")
+        raise  # propagate so update.sh exits with non-zero code
 
 
 if __name__ == "__main__":

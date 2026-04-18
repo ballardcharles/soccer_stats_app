@@ -528,6 +528,7 @@ view = st.sidebar.selectbox("View:", [
     "🔮 Match Predictor",
     "⚡ Shot Quality",
     "⚔️ Head-to-Head",
+    "🗺️ Tactics",
 ])
 
 st.sidebar.markdown("---")
@@ -2046,8 +2047,13 @@ elif view == "⭐ Player Grades":
         st.warning("No player data — run the Understat collector.")
         st.stop()
 
+    ps_for_grades = (
+        ps[ps["season"] == sel_season].copy()
+        if "season" in ps.columns and sel_season
+        else ps
+    )
     with st.spinner("Computing player grades…"):
-        pg = _get_player_grades(ps, load_events(sel_season), D["lineups"])
+        pg = _get_player_grades(ps_for_grades, load_events(sel_season), D["lineups"])
 
     if pg.empty:
         st.warning("Could not compute player grades.")
@@ -2459,7 +2465,7 @@ elif view == "⚡ Shot Quality":
 
     n_shots = len(shots_plot)
     avg_xg = shots_plot["xg"].mean()
-    goals = shots_plot[shots_plot["result"].str.lower() == "goal"]["xg"].count() if "result" in shots_plot.columns else 0
+    goals = shots_plot[shots_plot["result"].fillna("").str.lower() == "goal"]["xg"].count() if "result" in shots_plot.columns else 0
     total_xg = shots_plot["xg"].sum()
     xg_overperf = goals - total_xg
 
@@ -2498,7 +2504,7 @@ elif view == "⚡ Shot Quality":
     # High-quality shots overlay (xg > 0.2)
     hq = shots_plot[shots_plot["xg"] > 0.2].copy()
     if not hq.empty:
-        is_goal = hq["result"].str.lower() == "goal" if "result" in hq.columns else pd.Series([False] * len(hq))
+        is_goal = hq["result"].fillna("").str.lower() == "goal" if "result" in hq.columns else pd.Series([False] * len(hq))
         hq_colors = ["gold" if g else "white" for g in is_goal]
         pitch.scatter(
             hq["x"],
@@ -2543,7 +2549,7 @@ elif view == "⚡ Shot Quality":
                                  gridsize=10, cmap="Blues", zorder=2, alpha=0.65)
             hq_opp = opp_shots[opp_shots["xg"] > 0.2].copy()
             if not hq_opp.empty:
-                is_goal_opp = hq_opp["result"].str.lower() == "goal" if "result" in hq_opp.columns else pd.Series([False] * len(hq_opp))
+                is_goal_opp = hq_opp["result"].fillna("").str.lower() == "goal" if "result" in hq_opp.columns else pd.Series([False] * len(hq_opp))
                 pitch_opp.scatter(
                     hq_opp["x"], hq_opp["y"], ax=ax_opp,
                     s=hq_opp["xg"] * 600,
@@ -2804,6 +2810,425 @@ elif view == "⚔️ Head-to-Head":
 
     styled_comp = comp_df.style.apply(highlight_better, axis=1)
     st.dataframe(styled_comp, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🗺️  TACTICS & FORMATION
+# ══════════════════════════════════════════════════════════════════════════════
+# Three tabs built entirely from WhoScored events + ESPN lineups:
+#
+#   Average Positions — each player's mean event coordinate, coloured by
+#     position group, giving a natural picture of the team's shape.
+#
+#   Pass Network — nodes at average positions, edges between players who
+#     passed sequentially (approximates recipient without related_player_id).
+#     Edge weight = connection frequency; node size = pass volume.
+#
+#   Defensive Shape — scatter of tackles, interceptions, clearances and
+#     recoveries; average defensive action line; breakdown by pitch third.
+
+elif view == "🗺️ Tactics":
+    st.title("🗺️ Tactics & Formation")
+    st.markdown("Average positions, pass networks, and defensive shape — all from event data.")
+
+    lineups_tac = D["lineups"].copy()
+    ms_tac      = S["match_summary"].copy()
+
+    if ms_tac.empty:
+        st.warning("No match data for this season.")
+        st.stop()
+
+    all_teams_tac = team_list(ms_tac, "home_team", "away_team")
+    if not all_teams_tac:
+        st.warning("No teams found.")
+        st.stop()
+
+    # ── Top-level filters ─────────────────────────────────────────────────────
+    fc1, fc2, fc3 = st.columns([1, 2, 1])
+    with fc1:
+        sel_tac_team = st.selectbox("Team:", all_teams_tac, key="tac_team")
+    with fc3:
+        sel_tac_period = st.selectbox(
+            "Period:", ["Both Halves", "First Half", "Second Half"], key="tac_period"
+        )
+
+    with st.spinner("Loading events…"):
+        tac_events = load_events(sel_season)
+
+    if tac_events.empty:
+        st.warning("No event data for this season.")
+        st.stop()
+
+    # Filter to selected team; build match dropdown
+    team_ev = tac_events[tac_events["team"] == sel_tac_team].copy()
+    if team_ev.empty:
+        st.warning(f"No events found for {sel_tac_team} this season.")
+        st.stop()
+
+    team_ev["_label"] = team_ev.apply(match_label, axis=1)
+    match_opts = ["📅 Season Average"] + (
+        team_ev.drop_duplicates("_label")
+        .sort_values("match_date", ascending=False)["_label"]
+        .tolist()
+    )
+    with fc2:
+        sel_tac_match = st.selectbox("Match:", match_opts, key="tac_match")
+
+    # Apply match + period filters
+    if sel_tac_match == "📅 Season Average":
+        ev = team_ev.copy()
+        match_title = f"{sel_tac_team} — {sel_season} Season Average"
+    else:
+        ev = team_ev[team_ev["_label"] == sel_tac_match].copy()
+        match_title = f"{sel_tac_team} — {sel_tac_match}"
+
+    if sel_tac_period == "First Half":
+        ev = ev[ev["period"] == "FirstHalf"]
+    elif sel_tac_period == "Second Half":
+        ev = ev[ev["period"] == "SecondHalf"]
+
+    if ev.empty:
+        st.warning("No events found for this selection.")
+        st.stop()
+
+    # ── Starting lineup (single match only) ───────────────────────────────────
+    _pos_map = {"Goalkeeper": "GK", "Defender": "DEF",
+                "Midfielder": "MID", "Forward": "FWD"}
+    starters = pd.DataFrame()
+    if not lineups_tac.empty and sel_tac_match != "📅 Season Average":
+        md_val = ev["match_date"].dropna().iloc[0] if not ev["match_date"].dropna().empty else None
+        if md_val is not None:
+            lu_m = lineups_tac[
+                (lineups_tac["team"] == sel_tac_team) &
+                (pd.to_datetime(lineups_tac["match_date"], errors="coerce").dt.date
+                 == pd.to_datetime(md_val, errors="coerce").date())
+            ]
+            if not lu_m.empty:
+                starters = lu_m[
+                    lu_m["formation_place"].between(1, 11) &
+                    lu_m["sub_in"].isna()
+                ].copy()
+                starters["pos_group"] = starters["position"].map(_pos_map).fillna("MID")
+
+    # Infer formation string from position counts
+    formation_label = ""
+    if not starters.empty:
+        n_def = (starters["pos_group"] == "DEF").sum()
+        n_mid = (starters["pos_group"] == "MID").sum()
+        n_fwd = (starters["pos_group"] == "FWD").sum()
+        if n_def + n_mid + n_fwd >= 8:
+            formation_label = f"{n_def}-{n_mid}-{n_fwd}"
+
+    # ── Average positions per player ──────────────────────────────────────────
+    avg_pos = (
+        ev.dropna(subset=["x", "y", "player"])
+        .groupby("player")
+        .agg(avg_x=("x", "mean"), avg_y=("y", "mean"), n_events=("type", "count"))
+        .reset_index()
+    )
+    # Attach position group (from starters if available, else unknown)
+    if not starters.empty:
+        avg_pos = avg_pos.merge(
+            starters[["player", "pos_group"]].drop_duplicates("player"),
+            on="player", how="left",
+        )
+    if "pos_group" not in avg_pos.columns:
+        avg_pos["pos_group"] = "MID"
+    avg_pos["pos_group"] = avg_pos["pos_group"].fillna("MID")
+
+    # Colour scheme (consistent across all three tabs)
+    pos_colors = {"GK": "#f1c40f", "DEF": "#3498db", "MID": "#2ecc71", "FWD": "#e74c3c"}
+
+    tab_pos, tab_net, tab_def = st.tabs([
+        "📍 Average Positions",
+        "🔗 Pass Network",
+        "🛡️ Defensive Shape",
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tab 1 — Average Positions
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_pos:
+        st.subheader(match_title)
+        if formation_label:
+            st.caption(f"Inferred formation: **{formation_label}**  ·  based on starting lineup positions")
+
+        # Summary metrics
+        avg_x_team = avg_pos["avg_x"].mean()
+        def_row = avg_pos[avg_pos["pos_group"].isin(["GK", "DEF"])]
+        fwd_row = avg_pos[avg_pos["pos_group"] == "FWD"]
+        avg_def_line = def_row["avg_x"].mean() if not def_row.empty else np.nan
+        avg_att_line = fwd_row["avg_x"].mean() if not fwd_row.empty else np.nan
+
+        mp1, mp2, mp3, mp4 = st.columns(4)
+        mp1.metric("Players tracked", len(avg_pos))
+        mp2.metric("Team avg position", f"{avg_x_team:.0f}%" if not np.isnan(avg_x_team) else "—")
+        mp3.metric("Defensive line", f"{avg_def_line:.0f}%" if not np.isnan(avg_def_line) else "—")
+        mp4.metric("Attack height", f"{avg_att_line:.0f}%" if not np.isnan(avg_att_line) else "—")
+
+        fig_pos, ax_pos = plt.subplots(figsize=(12, 7))
+        pitch_pos = Pitch(pitch_type="opta", pitch_color=PITCH_GREEN,
+                          line_color="white", line_zorder=2)
+        pitch_pos.draw(ax=ax_pos)
+
+        for _, r in avg_pos.iterrows():
+            col  = pos_colors.get(r["pos_group"], "#aaaaaa")
+            size = float(np.clip(r["n_events"] / 5, 80, 600))
+            ax_pos.scatter(r["avg_x"], r["avg_y"], c=col, s=size,
+                           zorder=5, alpha=0.92, edgecolors="white", linewidths=1.2)
+            parts = str(r["player"]).split()
+            lbl   = parts[-1] if len(parts) > 1 else parts[0]
+            ax_pos.text(r["avg_x"], r["avg_y"] + 3.5, lbl,
+                        ha="center", va="bottom", fontsize=7,
+                        color="white", fontweight="bold", zorder=6)
+
+        if not np.isnan(avg_x_team):
+            ax_pos.axvline(avg_x_team, color="white", lw=0.8,
+                           linestyle="--", alpha=0.4, zorder=3)
+
+        legend_els = [
+            mpatches.Patch(color=c, label=pg)
+            for pg, c in pos_colors.items()
+            if pg in avg_pos["pos_group"].values
+        ]
+        ax_pos.legend(handles=legend_els, loc="upper left",
+                      facecolor="#1a1a1a", labelcolor="white", fontsize=8)
+        ax_pos.set_title(f"Average Positions — {match_title}",
+                         color="white", fontsize=11, pad=10)
+        dark_fig_style(fig_pos, ax_pos)
+        plt.tight_layout()
+        st.pyplot(fig_pos)
+        plt.close(fig_pos)
+        st.caption(
+            "Dot size = event volume (more active = larger).  "
+            "Position = average of all recorded event coordinates.  "
+            "Dashed line = team average x-position."
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tab 2 — Pass Network
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_net:
+        st.subheader(match_title)
+
+        passes = (
+            ev[ev["type"] == "Pass"]
+            .dropna(subset=["player", "x", "y"])
+            .sort_values("minute")
+            .reset_index(drop=True)
+        )
+
+        if len(passes) < 5:
+            st.info("Not enough pass data for this selection.")
+        else:
+            total_passes = len(passes)
+            succ_passes  = (passes["outcome_type"].fillna("").str.lower() == "successful").sum()
+            pass_comp    = 100 * succ_passes / total_passes if total_passes else 0
+            avg_pass_len = np.sqrt(
+                (passes["end_x"].fillna(passes["x"]) - passes["x"]) ** 2 +
+                (passes["end_y"].fillna(passes["y"]) - passes["y"]) ** 2
+            ).mean()
+
+            pn1, pn2, pn3 = st.columns(3)
+            pn1.metric("Total passes", total_passes)
+            pn2.metric("Completion", f"{pass_comp:.0f}%")
+            pn3.metric("Avg length", f"{avg_pass_len:.1f}")
+
+            # Sequential connection approximation:
+            # Each pass is linked to the next pass by the same team within ≤ 3 min.
+            passes["_next_player"] = passes["player"].shift(-1)
+            passes["_next_min"]    = passes["minute"].shift(-1)
+            conn = passes[
+                (passes["_next_min"] - passes["minute"]).fillna(999) <= 3
+            ][["player", "_next_player"]].copy()
+            conn.columns = ["from_player", "to_player"]
+            conn = conn[conn["from_player"] != conn["to_player"]]
+
+            conn_counts = (
+                conn.groupby(["from_player", "to_player"])
+                .size().reset_index(name="count")
+            )
+            conn_counts = conn_counts[conn_counts["count"] >= 2]
+
+            # Node positions + pass volume
+            pass_vol = passes.groupby("player").size().reset_index(name="pass_count")
+            net_pos  = avg_pos.merge(pass_vol, on="player", how="left")
+            net_pos["pass_count"] = net_pos["pass_count"].fillna(0)
+
+            fig_net, ax_net = plt.subplots(figsize=(12, 7))
+            pitch_net = Pitch(pitch_type="opta", pitch_color=PITCH_GREEN,
+                              line_color="white", line_zorder=2)
+            pitch_net.draw(ax=ax_net)
+
+            # Draw edges first (behind nodes)
+            if not conn_counts.empty:
+                max_c = conn_counts["count"].max()
+                for _, edge in conn_counts.iterrows():
+                    fp = net_pos[net_pos["player"] == edge["from_player"]]
+                    tp = net_pos[net_pos["player"] == edge["to_player"]]
+                    if fp.empty or tp.empty:
+                        continue
+                    lw    = 1.0 + 5.0 * (edge["count"] / max_c)
+                    alpha = 0.25 + 0.55 * (edge["count"] / max_c)
+                    ax_net.plot(
+                        [fp["avg_x"].values[0], tp["avg_x"].values[0]],
+                        [fp["avg_y"].values[0], tp["avg_y"].values[0]],
+                        color="#00ff85", linewidth=lw, alpha=alpha, zorder=3,
+                    )
+
+            # Draw nodes on top
+            for _, r in net_pos.iterrows():
+                col  = pos_colors.get(r.get("pos_group", "MID"), "#aaaaaa")
+                size = float(np.clip(r["pass_count"] * 7, 80, 700))
+                ax_net.scatter(r["avg_x"], r["avg_y"], c=col, s=size,
+                               zorder=5, alpha=0.95,
+                               edgecolors="white", linewidths=1.5)
+                parts = str(r["player"]).split()
+                lbl   = parts[-1] if len(parts) > 1 else parts[0]
+                ax_net.text(r["avg_x"], r["avg_y"] + 3.5, lbl,
+                            ha="center", va="bottom", fontsize=7,
+                            color="white", fontweight="bold", zorder=6)
+
+            ax_net.set_title(f"Pass Network — {match_title}",
+                             color="white", fontsize=11, pad=10)
+            dark_fig_style(fig_net, ax_net)
+            plt.tight_layout()
+            st.pyplot(fig_net)
+            plt.close(fig_net)
+            st.caption(
+                "Node position = average event position.  "
+                "Node size = pass volume.  "
+                "Line thickness = connection frequency (≥ 2 sequential passes).  "
+                "Connections are approximated from consecutive team passes within 3 minutes."
+            )
+
+            if not conn_counts.empty:
+                st.markdown("**Strongest connections**")
+                st.dataframe(
+                    conn_counts.sort_values("count", ascending=False)
+                    .head(10)
+                    .rename(columns={"from_player": "From", "to_player": "To", "count": "Passes"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tab 3 — Defensive Shape
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_def:
+        st.subheader(match_title)
+
+        def_type_colors = {
+            "Tackle":       "#e74c3c",
+            "Interception": "#3498db",
+            "Clearance":    "#f39c12",
+            "BallRecovery": "#2ecc71",
+            "BlockedShot":  "#9b59b6",
+        }
+        def_ev = (
+            ev[ev["type"].isin(def_type_colors.keys())]
+            .dropna(subset=["x", "y"])
+            .copy()
+        )
+
+        if def_ev.empty:
+            st.info("No defensive action data found for this selection.")
+        else:
+            total_def    = len(def_ev)
+            n_att_third  = (def_ev["x"] >= 67).sum()
+            n_mid_third  = ((def_ev["x"] >= 33) & (def_ev["x"] < 67)).sum()
+            n_def_third  = (def_ev["x"] < 33).sum()
+            avg_press_x  = def_ev["x"].mean()
+            press_pct    = 100 * n_att_third / total_def if total_def else 0
+
+            dd1, dd2, dd3, dd4 = st.columns(4)
+            dd1.metric("Defensive actions", total_def)
+            dd2.metric("Press height",      f"{avg_press_x:.0f}%")
+            dd3.metric("In attacking ⅓",   f"{press_pct:.0f}%")
+            dd4.metric("In defensive ⅓",   f"{100*n_def_third/total_def:.0f}%")
+
+            c_pitch, c_bar = st.columns([3, 1])
+
+            with c_pitch:
+                fig_def, ax_def = plt.subplots(figsize=(10, 6))
+                pitch_def = Pitch(pitch_type="opta", pitch_color=PITCH_GREEN,
+                                  line_color="white", line_zorder=2)
+                pitch_def.draw(ax=ax_def)
+
+                for dtype, dcolor in def_type_colors.items():
+                    sub = def_ev[def_ev["type"] == dtype]
+                    if not sub.empty:
+                        ax_def.scatter(sub["x"], sub["y"], c=dcolor,
+                                       s=28, alpha=0.65, zorder=4,
+                                       label=dtype, edgecolors="none")
+
+                # Average defensive action x-line
+                ax_def.axvline(avg_press_x, color="white", lw=1.5,
+                               linestyle="--", alpha=0.75, zorder=5,
+                               label=f"Avg line ({avg_press_x:.0f}%)")
+
+                # Light shading for pitch thirds
+                ax_def.axvspan(0,   33,  alpha=0.04, color="#3498db")
+                ax_def.axvspan(67,  100, alpha=0.04, color="#e74c3c")
+
+                ax_def.legend(loc="upper left", facecolor="#1a1a1a",
+                              labelcolor="white", fontsize=7, markerscale=1.3)
+                ax_def.set_title(f"Defensive Shape — {match_title}",
+                                 color="white", fontsize=11, pad=10)
+                dark_fig_style(fig_def, ax_def)
+                plt.tight_layout()
+                st.pyplot(fig_def)
+                plt.close(fig_def)
+
+            with c_bar:
+                st.markdown("**By pitch third**")
+                thirds_df = pd.DataFrame({
+                    "Third":   ["Attacking ⅓", "Middle ⅓", "Defensive ⅓"],
+                    "Actions": [int(n_att_third), int(n_mid_third), int(n_def_third)],
+                })
+                thirds_df["Pct"] = (
+                    100 * thirds_df["Actions"] / total_def
+                ).round(1).astype(str) + "%"
+                fig_thirds = px.bar(
+                    thirds_df, x="Actions", y="Third",
+                    orientation="h",
+                    color="Third",
+                    color_discrete_map={
+                        "Attacking ⅓": "#e74c3c",
+                        "Middle ⅓":    "#f39c12",
+                        "Defensive ⅓": "#3498db",
+                    },
+                    text="Pct",
+                    hover_data={"Pct": True, "Actions": True, "Third": False},
+                    height=220,
+                )
+                fig_thirds.update_layout(
+                    plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                    font=dict(color="white"), showlegend=False,
+                    xaxis=dict(gridcolor="#333"),
+                    yaxis=dict(gridcolor="#333"),
+                    margin=dict(t=10, b=10, l=10, r=10),
+                )
+                st.plotly_chart(fig_thirds, use_container_width=True)
+
+            # Action type breakdown table
+            st.markdown("**By action type**")
+            type_summary = (
+                def_ev.groupby("type")
+                .agg(
+                    Total=("type", "count"),
+                    Successful=("outcome_type", lambda x:
+                                (x.fillna("").str.lower() == "successful").sum()),
+                )
+                .reset_index()
+            )
+            type_summary["Success %"] = (
+                100 * type_summary["Successful"] / type_summary["Total"]
+            ).round(1)
+            st.dataframe(
+                type_summary.rename(columns={"type": "Action"})
+                .sort_values("Total", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

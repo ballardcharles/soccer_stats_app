@@ -137,23 +137,33 @@ def main() -> None:
         # ── lineups ───────────────────────────────────────────────────────────
         write_table(conn, load_csv("lineups.csv"), "lineups")
 
-        # ── events (slimmed to 15 cols) ───────────────────────────────────────
-        events_raw = load_csv("events.csv")
-        if not events_raw.empty:
-            keep = [c for c in EVENTS_KEEP if c in events_raw.columns]
-            dropped = set(events_raw.columns) - set(keep)
-            if dropped:
-                log(f"  Dropping {len(dropped)} unused events columns: {sorted(dropped)}")
-            events_slim = events_raw[keep]
+        # ── events (usecols — never loads the 821 MB full file into RAM) ────────
+        events_path = PROCESSED / "events.csv"
+        if events_path.exists():
+            log("Reading events.csv (usecols — slimmed to used columns only)…")
+            t0 = time.time()
+            events_slim = pd.read_csv(
+                events_path,
+                usecols=lambda c: c in set(EVENTS_KEEP),
+                low_memory=False,
+            )
+            log(f"  → {len(events_slim):,} rows, {len(events_slim.columns)} cols  ({time.time()-t0:.1f}s)")
             write_table(conn, events_slim, "events")
+        else:
+            log("WARNING: events.csv not found — skipping events table.")
 
         # ── indexes ───────────────────────────────────────────────────────────
         create_indexes(conn)
 
-        # ── VACUUM to compact and verify ──────────────────────────────────────
+        # ── Switch to DELETE journal mode before VACUUM ───────────────────────
+        # WAL mode leaves .db-wal/.db-shm sidecar files; switching to DELETE
+        # ensures the committed DB is a single clean file with no sidecars.
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.commit()
+
+        # ── VACUUM to compact the file ────────────────────────────────────────
         log("Running VACUUM …")
         conn.execute("VACUUM")
-        conn.commit()
 
     finally:
         conn.close()

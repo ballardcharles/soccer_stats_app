@@ -27,7 +27,7 @@ pyarrow==23.0.1
 pydeck==0.9.1
 Pygments==2.19.2
 python-dateutil==2.9.0.post0
-pytz==2026.1.post1
+pytz>=2024.1
 PyYAML==6.0.3
 referencing==0.37.0
 requests==2.32.3
@@ -42,4 +42,4 @@ toml==0.10.2
 tornado==6.5.4
 typing_extensions==4.15.0
 tzdata==2025.3
-urllib3==1.26.20
+urllib3>=2.0,<3

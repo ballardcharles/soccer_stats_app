@@ -91,105 +91,60 @@ def flatten_match_summary(ms: pd.DataFrame) -> pd.DataFrame:
     ms = ms.copy()
     ms["match_date"] = pd.to_datetime(ms["match_date"], utc=True, errors="coerce")
 
-    rows = []
+    def _col(src: pd.DataFrame, name: str) -> pd.Series:
+        """Return column or an all-NaN Series if the column is absent."""
+        return src[name] if name in src.columns else pd.Series(np.nan, index=src.index)
 
-    for _, match in ms.iterrows():
-        # Build a perspective dict for each side
-        sides = [
-            dict(
-                side="home",
-                team=match["home_team"],
-                opponent=match["away_team"],
-                is_home=True,
-                goals=match["home_goals"],
-                goals_conceded=match["away_goals"],
-                xg=match["home_xg"],
-                xga=match["away_xg"],
-                shots=match.get("home_total_shots", np.nan),
-                shots_on_target=match.get("home_shots_on_target", np.nan),
-                possession_pct=match.get("home_possession_pct", np.nan),
-                pass_pct=match.get("home_pass_pct", np.nan),
-                tackle_pct=match.get("home_tackle_pct", np.nan),
-                interceptions=match.get("home_interceptions", np.nan),
-                saves=match.get("home_saves", np.nan),
-                fouls=match.get("home_fouls_committed", np.nan),
-                yellow_cards=match.get("home_yellow_cards", np.nan),
-                red_cards=match.get("home_red_cards", np.nan),
-            ),
-            dict(
-                side="away",
-                team=match["away_team"],
-                opponent=match["home_team"],
-                is_home=False,
-                goals=match["away_goals"],
-                goals_conceded=match["home_goals"],
-                xg=match["away_xg"],
-                xga=match["home_xg"],
-                shots=match.get("away_total_shots", np.nan),
-                shots_on_target=match.get("away_shots_on_target", np.nan),
-                possession_pct=match.get("away_possession_pct", np.nan),
-                pass_pct=match.get("away_pass_pct", np.nan),
-                tackle_pct=match.get("away_tackle_pct", np.nan),
-                interceptions=match.get("away_interceptions", np.nan),
-                saves=match.get("away_saves", np.nan),
-                fouls=match.get("away_fouls_committed", np.nan),
-                yellow_cards=match.get("away_yellow_cards", np.nan),
-                red_cards=match.get("away_red_cards", np.nan),
-            ),
-        ]
+    def _build_side(src: pd.DataFrame, mine: str, theirs: str) -> pd.DataFrame:
+        """Vectorised construction of one long-format row per match for one side."""
+        g_me  = pd.to_numeric(src[f"{mine}_goals"],   errors="coerce")
+        g_opp = pd.to_numeric(src[f"{theirs}_goals"],  errors="coerce")
+        xg_me = pd.to_numeric(src[f"{mine}_xg"],      errors="coerce")
+        shots  = pd.to_numeric(_col(src, f"{mine}_total_shots"),       errors="coerce")
+        sot    = pd.to_numeric(_col(src, f"{mine}_shots_on_target"),   errors="coerce")
 
-        for s in sides:
-            g = s["goals"]
-            gc = s["goals_conceded"]
+        both_known = g_me.notna() & g_opp.notna()
+        result = np.where(~both_known, None,
+                 np.where(g_me > g_opp, "W",
+                 np.where(g_me == g_opp, "D", "L")))
+        points = np.where(result == "W", 3.0,
+                 np.where(result == "D", 1.0,
+                 np.where(result == "L", 0.0, np.nan)))
 
-            # Result / points from this team's perspective
-            if pd.notna(g) and pd.notna(gc):
-                if g > gc:
-                    result, points = "W", 3
-                elif g == gc:
-                    result, points = "D", 1
-                else:
-                    result, points = "L", 0
-            else:
-                result, points = np.nan, np.nan
+        shots_pos = shots.fillna(0) > 0
+        sot_pct     = np.where(shots_pos, sot / shots * 100, np.nan)
+        xg_per_shot = np.where(shots_pos, xg_me / shots,     np.nan)
 
-            # Derived shooting quality metrics
-            shots = s["shots"]
-            sot = s["shots_on_target"]
-            xg = s["xg"]
+        return pd.DataFrame({
+            "season":              src["season"],
+            "match_date":          src["match_date"],
+            "team":                src[f"{mine}_team"],
+            "opponent":            src[f"{theirs}_team"],
+            "is_home":             (mine == "home"),
+            "goals":               g_me,
+            "goals_conceded":      g_opp,
+            "xg":                  xg_me,
+            "xga":                 pd.to_numeric(src[f"{theirs}_xg"], errors="coerce"),
+            "shots":               shots,
+            "shots_on_target":     sot,
+            "shots_on_target_pct": sot_pct,
+            "xg_per_shot":         xg_per_shot,
+            "possession_pct":      pd.to_numeric(_col(src, f"{mine}_possession_pct"),    errors="coerce"),
+            "pass_pct":            pd.to_numeric(_col(src, f"{mine}_pass_pct"),          errors="coerce"),
+            "tackle_pct":          pd.to_numeric(_col(src, f"{mine}_tackle_pct"),        errors="coerce"),
+            "interceptions":       pd.to_numeric(_col(src, f"{mine}_interceptions"),     errors="coerce"),
+            "saves":               pd.to_numeric(_col(src, f"{mine}_saves"),             errors="coerce"),
+            "fouls":               pd.to_numeric(_col(src, f"{mine}_fouls_committed"),   errors="coerce"),
+            "yellow_cards":        pd.to_numeric(_col(src, f"{mine}_yellow_cards"),      errors="coerce"),
+            "red_cards":           pd.to_numeric(_col(src, f"{mine}_red_cards"),         errors="coerce"),
+            "result":              pd.array(result, dtype=object),
+            "points":              pd.to_numeric(pd.array(points, dtype=object), errors="coerce"),
+        })
 
-            sot_pct = (sot / shots * 100) if (pd.notna(shots) and pd.notna(sot) and shots > 0) else np.nan
-            xg_per_shot = (xg / shots) if (pd.notna(xg) and pd.notna(shots) and shots > 0) else np.nan
-
-            rows.append(
-                {
-                    "season": match["season"],
-                    "match_date": match["match_date"],
-                    "team": s["team"],
-                    "opponent": s["opponent"],
-                    "is_home": s["is_home"],
-                    "goals": g,
-                    "goals_conceded": gc,
-                    "xg": xg,
-                    "xga": s["xga"],
-                    "shots": shots,
-                    "shots_on_target": sot,
-                    "shots_on_target_pct": sot_pct,
-                    "xg_per_shot": xg_per_shot,
-                    "possession_pct": s["possession_pct"],
-                    "pass_pct": s["pass_pct"],
-                    "tackle_pct": s["tackle_pct"],
-                    "interceptions": s["interceptions"],
-                    "saves": s["saves"],
-                    "fouls": s["fouls"],
-                    "yellow_cards": s["yellow_cards"],
-                    "red_cards": s["red_cards"],
-                    "result": result,
-                    "points": points,
-                }
-            )
-
-    flat = pd.DataFrame(rows)
+    flat = pd.concat(
+        [_build_side(ms, "home", "away"), _build_side(ms, "away", "home")],
+        ignore_index=True,
+    )
     flat = flat.sort_values(["season", "match_date", "team"]).reset_index(drop=True)
     return flat
 
@@ -309,17 +264,17 @@ def compute_season_grades(flat: pd.DataFrame) -> pd.DataFrame:
         defense_raw = 0.40 * sc_xga_inv + 0.20 * sc_gc_inv + 0.20 * sc_saves + 0.20 * sc_inter
         style_raw   = 0.40 * sc_poss + 0.40 * sc_pass + 0.20 * sc_tackle
 
-        # Re-scale composites back to [1,10] so each sub-grade is self-consistent
-        g["attack_grade"]  = _minmax_scale(attack_raw)
-        g["defense_grade"] = _minmax_scale(defense_raw)
-        g["style_grade"]   = _minmax_scale(style_raw)
+        # Weighted composites of [1,10] inputs (weights sum to 1) are already
+        # in [1,10] — re-scaling would distort the documented weights.
+        g["attack_grade"]  = attack_raw
+        g["defense_grade"] = defense_raw
+        g["style_grade"]   = style_raw
 
-        overall_raw = (
+        g["overall_grade"] = (
             0.40 * g["attack_grade"]
             + 0.40 * g["defense_grade"]
             + 0.20 * g["style_grade"]
         )
-        g["overall_grade"] = _minmax_scale(overall_raw)
 
         grade_rows.append(g)
 
@@ -425,16 +380,15 @@ def compute_rolling_grades(flat: pd.DataFrame, n: int = 5) -> pd.DataFrame:
         defense_raw = 0.40 * sc_xga_inv + 0.20 * sc_gc_inv + 0.20 * sc_saves + 0.20 * sc_inter
         style_raw   = 0.40 * sc_poss + 0.40 * sc_pass + 0.20 * sc_tackle
 
-        g["roll_attack_grade"]  = _minmax_scale(attack_raw)
-        g["roll_defense_grade"] = _minmax_scale(defense_raw)
-        g["roll_style_grade"]   = _minmax_scale(style_raw)
+        g["roll_attack_grade"]  = attack_raw
+        g["roll_defense_grade"] = defense_raw
+        g["roll_style_grade"]   = style_raw
 
-        overall_raw = (
+        g["roll_overall_grade"] = (
             0.40 * g["roll_attack_grade"]
             + 0.40 * g["roll_defense_grade"]
             + 0.20 * g["roll_style_grade"]
         )
-        g["roll_overall_grade"] = _minmax_scale(overall_raw)
 
         grade_parts.append(g)
 
@@ -716,24 +670,20 @@ def compute_player_grades(
                 + 0.25 * _minmax_scale(g["clearances_p90"])
                 + 0.20 * _minmax_scale(g["recoveries_p90"])
             )
-            g["defensive_grade"] = _minmax_scale(def_raw)
+            g["defensive_grade"] = def_raw  # weighted sum of [1,10] inputs → [1,10]
 
             # ── Overall grade — position-adjusted weights ─────────────────────
-            # Defenders: defensive contributions weighted most heavily
-            # Midfielders: balanced across all three dimensions
-            # Forwards: attacking output weighted most heavily
             weights = {
                 "DEF": (0.25, 0.20, 0.55),
                 "MID": (0.35, 0.35, 0.30),
                 "FWD": (0.50, 0.35, 0.15),
             }.get(pos_group, (0.35, 0.35, 0.30))
 
-            overall_raw = (
+            g["overall_grade"] = (
                 weights[0] * g["attack_grade"]
                 + weights[1] * g["creativity_grade"]
                 + weights[2] * g["defensive_grade"]
             )
-            g["overall_grade"] = _minmax_scale(overall_raw)
 
         grade_parts.append(g)
 

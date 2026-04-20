@@ -89,13 +89,58 @@ def detect_seasons() -> list[int]:
 # Load raw data for a single season
 # ---------------------------------------------------------------------------
 
+def _detect_espn_season(us_season: int) -> str:
+    """
+    Return the ESPN season string whose schedule file contains data for the
+    season starting in `us_season`.
+
+    Historical files were collected with the START-year convention (e.g.
+    "2023" → 2023/24 season data).  Files collected after the run_collection
+    fix use the END-year convention (e.g. "2026" → 2025/26 season data).
+
+    We check both candidates and pick whichever file's first date falls in
+    the expected start year.  If both match (2025/26 has both _2025_ and
+    _2026_), we prefer the end-year file since it is more complete.
+    """
+    expected_start = us_season          # e.g. 2023 → season starts Aug 2023
+    end_yr   = str(us_season + 1)
+    start_yr = str(us_season)
+
+    def _start_year_of_file(candidate: str) -> int | None:
+        path = RAW_ESPN / f"{ESPN_LEAGUE}_{candidate}_team_schedule.csv"
+        if not path.exists():
+            return None
+        try:
+            row = pd.read_csv(path, usecols=["date"], nrows=1)
+            return pd.to_datetime(row["date"].iloc[0], utc=True).year
+        except Exception:
+            return None
+
+    yr_end   = _start_year_of_file(end_yr)
+    yr_start = _start_year_of_file(start_yr)
+
+    # Prefer end-year file when it matches (the "correct" new convention)
+    if yr_end == expected_start:
+        return end_yr
+    if yr_start == expected_start:
+        return start_yr
+    # Fallback: end-year convention (might be empty / trigger graceful skip)
+    return end_yr
+
+
 def load_raw(us_season: int) -> dict[str, pd.DataFrame]:
     """Load all raw source files for one season.
 
     Missing files are returned as empty DataFrames — build functions
     downstream handle absent data gracefully.
+
+    Season year conventions:
+        Understat / WhoScored  →  START year  (2025 = 2025/26)
+        ESPN                   →  auto-detected (historical files use start
+                                  year; files collected after the run_collection
+                                  fix use end year)
     """
-    espn_season = str(us_season)
+    espn_season = _detect_espn_season(us_season)
     ws_season   = str(us_season)
 
     sources = {
@@ -147,7 +192,11 @@ def build_match_crossref(data: dict, us_season: int) -> pd.DataFrame:
         espn = data["espn_schedule"].copy()
         canonicalize_teams(espn, "home_team", "away_team")
         espn["match_date"] = normalize_date(espn["date"]).dt.date
-        espn_key = espn[["match_date", "home_team", "away_team", "game_id", "game"]].rename(
+        # "game" (string label) is optional — newer soccerdata versions may omit it
+        key_cols = ["match_date", "home_team", "away_team", "game_id"]
+        if "game" in espn.columns:
+            key_cols.append("game")
+        espn_key = espn[key_cols].rename(
             columns={"game_id": "espn_game_id", "game": "espn_game_str"}
         )
 
@@ -269,18 +318,46 @@ def build_match_summary(data: dict, crossref: pd.DataFrame, us_season: int) -> p
 
     espn_stats = data["espn_stats"].copy()
 
-    if espn_stats.empty or "game" not in espn_stats.columns:
+    if espn_stats.empty:
         return summary
 
     if "roster" in espn_stats.columns:
         espn_stats = espn_stats.drop(columns=["roster"])
 
+    # Attach espn_game_id to each stats row so we can join to the crossref.
+    # Strategy: the stats CSV rows are in the same order as the schedule's
+    # completed matches (one home + one away row per match).  We assign
+    # game_ids positionally by repeating each schedule game_id twice.
     espn_sched = data["espn_schedule"]
-    if not espn_sched.empty and "game" in espn_sched.columns:
-        game_to_id = espn_sched.set_index("game")["game_id"].to_dict()
-        espn_stats["espn_game_id"] = espn_stats["game"].map(game_to_id)
-    else:
+    if espn_stats.empty or espn_sched.empty or "game_id" not in espn_sched.columns:
         return summary
+
+    if "game_id" not in espn_stats.columns:
+        # Deduplicate schedule rows first (re-runs may create extra schedule entries)
+        sched_ids = (
+            espn_sched.drop_duplicates("game_id")
+            .sort_values("date")["game_id"]
+            .tolist()
+        )
+        # Each match produces exactly 2 stats rows (one per team)
+        expected_rows = len(sched_ids) * 2
+        if len(espn_stats) % 2 == 0 and len(espn_stats) <= expected_rows:
+            # Clean file — positional assignment is safe
+            n_matches = len(espn_stats) // 2
+            repeated_ids = [gid for gid in sched_ids[:n_matches] for _ in range(2)]
+            espn_stats = espn_stats.iloc[:len(repeated_ids)].copy()
+            espn_stats["game_id"] = repeated_ids
+        elif len(espn_stats) > expected_rows:
+            # Duplicate rows from the dedup bug — deduplicate by taking the
+            # first 2 rows per game (in schedule order) before assigning IDs
+            n_matches = len(sched_ids)
+            repeated_ids = [gid for gid in sched_ids for _ in range(2)]
+            espn_stats = espn_stats.iloc[:len(repeated_ids)].copy()
+            espn_stats["game_id"] = repeated_ids
+        else:
+            return summary
+
+    espn_stats = espn_stats.rename(columns={"game_id": "espn_game_id"})
 
     home = espn_stats[espn_stats["is_home"] == True].copy()
     away = espn_stats[espn_stats["is_home"] == False].copy()

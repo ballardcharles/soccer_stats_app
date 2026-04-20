@@ -34,9 +34,9 @@ from src.utils import ensure_dir
 # To do a fast weekly update, you can temporarily comment out older seasons.
 
 SEASONS = [
-    2023,   # 2023/24
+    # 2023,   # 2023/24
     #2024,   # 2024/25
-   #2025,   # 2025/26
+   2025,   # 2025/26
     # 2026, # 2026/27  — uncomment when that season starts
 ]
 
@@ -60,9 +60,12 @@ ensure_dir("logs")
 if __name__ == "__main__":
 
     for us_year in SEASONS:
-        espn_season = str(us_year)
+        # Understat uses the START year of the season (2025 = 2025/26).
+        # ESPN uses the END year of the season  (2026 = 2025/26).
+        # WhoScored uses the same year as Understat.
+        espn_season = str(us_year + 1)
         ws_season   = str(us_year)
-        label       = f"{us_year - 1}/{str(us_year)[2:]}"
+        label       = f"{us_year}/{str(us_year + 1)[2:]}"
 
         print(f"\n{'='*55}")
         print(f"Season: {label}  (year={us_year})")

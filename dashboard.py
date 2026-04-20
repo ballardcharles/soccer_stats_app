@@ -447,26 +447,15 @@ def _flatten_ms(ms: pd.DataFrame) -> pd.DataFrame:
     if ms.empty:
         return pd.DataFrame()
 
-    pct_pairs = [
-        ("home_possession_pct", "away_possession_pct", "possession_pct"),
-        ("home_pass_pct",       "away_pass_pct",       "pass_pct"),
-        ("home_shot_pct",       "away_shot_pct",       "shot_pct"),
-        ("home_tackle_pct",     "away_tackle_pct",     "tackle_pct"),
-    ]
-
     home_cols = {"home_team": "team", "home_xg": "xg_for", "away_xg": "xg_against",
-                 "home_goals": "goals_for", "away_goals": "goals_against"}
+                 "home_goals": "goals_for", "away_goals": "goals_against", "home_possession_pct": "possession_pct",
+                 "home_pass_pct": "pass_pct", "home_shot_pct": "shot_pct", "home_tackle_pct": "tackle_pct"}
     away_cols = {"away_team": "team", "away_xg": "xg_for", "home_xg": "xg_against",
-                 "away_goals": "goals_for", "home_goals": "goals_against"}
+                 "away_goals": "goals_for", "home_goals": "goals_against", "away_possession_pct": "possession_pct",
+                 "away_pass_pct": "pass_pct", "away_shot_pct": "shot_pct", "away_tackle_pct": "tackle_pct"}
 
     base_home = ms[[c for c in home_cols if c in ms.columns]].rename(columns=home_cols)
     base_away = ms[[c for c in away_cols if c in ms.columns]].rename(columns=away_cols)
-
-    for h_col, a_col, out_col in pct_pairs:
-        if h_col in ms.columns:
-            base_home[out_col] = ms[h_col].values
-        if a_col in ms.columns:
-            base_away[out_col] = ms[a_col].values
 
     flat = pd.concat([base_home, base_away], ignore_index=True)
     num_cols = [c for c in flat.columns if c != "team"]
@@ -2612,22 +2601,59 @@ elif view == "⚔️ Head-to-Head":
     st.title("⚔️ Head-to-Head")
     st.markdown("Radar comparison, historical record, and key stats.")
 
-    ms = S["match_summary"].copy()
-    crossref_all = D["match_crossref"].copy()
+    ms_all_h2h    = D["match_summary"].copy()   # all seasons — for radar/stats
+    crossref_all  = D["match_crossref"].copy()
 
-    if ms.empty:
-        st.warning("No match summary data for this season.")
+    if ms_all_h2h.empty:
+        st.warning("No match summary data available.")
         st.stop()
 
-    all_teams_h2h = team_list(ms, "home_team", "away_team")
+    # Season selector for H2H stats — defaults to the most recent season that
+    # has ESPN match stats (possession, pass %, etc.).  2025/26 onward may only
+    # have xG (Understat) until the ESPN collector is updated.
+    _pct_check_col = "home_possession_pct"
+    seasons_with_espn = []
+    if "season" in ms_all_h2h.columns and _pct_check_col in ms_all_h2h.columns:
+        seasons_with_espn = (
+            ms_all_h2h[ms_all_h2h[_pct_check_col].notna() & (ms_all_h2h[_pct_check_col] != 0)]
+            ["season"].dropna().unique().tolist()
+        )
+        seasons_with_espn = sorted(seasons_with_espn, reverse=True)
+
+    all_seasons_h2h = sorted(
+        ms_all_h2h["season"].dropna().unique().tolist(), reverse=True
+    ) if "season" in ms_all_h2h.columns else []
+
+    hc1, hc2, hc3 = st.columns([1, 1, 1])
+    with hc3:
+        h2h_season = st.selectbox(
+            "Stats season:",
+            all_seasons_h2h,
+            index=0,
+            key="h2h_season",
+            help="Season used for radar and key stats. Pick a season with full ESPN data for possession/pass/tackle stats.",
+        )
+
+    ms = ms_all_h2h[ms_all_h2h["season"] == h2h_season].copy() if "season" in ms_all_h2h.columns else ms_all_h2h.copy()
+
+    # Warn if selected season is missing ESPN match stats
+    if _pct_check_col in ms.columns and ms[_pct_check_col].isna().all():
+        st.warning(
+            f"⚠️ ESPN match stats (possession, pass %, shots, tackles) are not available "
+            f"for **{h2h_season}** — only xG will appear in the radar. "
+            f"Select **{seasons_with_espn[0]}** for full stats."
+            if seasons_with_espn else
+            f"⚠️ ESPN match stats are not available for **{h2h_season}**."
+        )
+
+    all_teams_h2h = team_list(ms_all_h2h, "home_team", "away_team")
     if len(all_teams_h2h) < 2:
         st.warning("Not enough teams in match summary data.")
         st.stop()
 
-    col_a, col_b = st.columns(2)
-    with col_a:
+    with hc1:
         team_a = st.selectbox("Team A:", all_teams_h2h, index=0)
-    with col_b:
+    with hc2:
         default_b_idx = 1 if (team_a == all_teams_h2h[0] and len(all_teams_h2h) > 1) else 0
         team_b = st.selectbox("Team B:", all_teams_h2h, index=default_b_idx)
 
@@ -2637,7 +2663,7 @@ elif view == "⚔️ Head-to-Head":
 
     # ── Build per-team averages from match_summary ────────────────────────────
     team_stats_h2h = (
-        _flatten_ms(ms)
+        _flatten_ms(ms).copy()
         .groupby("team").mean(numeric_only=True).reset_index()
     )
 
@@ -2789,10 +2815,30 @@ elif view == "⚔️ Head-to-Head":
 
     row_a = _team_row(team_stats_h2h, team_a)
     row_b = _team_row(team_stats_h2h, team_b)
+
+    # Columns stored as fractions (0–1) that should display as percentages
+    _pct_cols = {"possession_pct", "pass_pct", "shot_pct", "tackle_pct"}
+
     comparison_rows = []
     for col, label in zip(metric_cols, metric_labels):
-        val_a = round(float(row_a[col]), 3) if row_a is not None and col in row_a.index else None
-        val_b = round(float(row_b[col]), 3) if row_b is not None and col in row_b.index else None
+        def _fmt(row, c=col):
+            if row is None or c not in row.index:
+                return None
+            v = row[c]
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None
+            if pd.isna(v):
+                return None
+            # possession_pct is 0-100; pass/shot/tackle_pct are 0-1 fractions
+            if c in _pct_cols and c != "possession_pct":
+                v = round(v * 100, 1)
+            else:
+                v = round(v, 3)
+            return v
+        val_a = _fmt(row_a)
+        val_b = _fmt(row_b)
         comparison_rows.append({"Metric": label, team_a: val_a, team_b: val_b})
 
     comp_df = pd.DataFrame(comparison_rows)
@@ -3315,14 +3361,11 @@ elif view == "🗺️ Tactics":
             )
 
             # Formation frequency bar chart
-            form_counts = (
-                team_forms["formation"].value_counts()
-                .reset_index()
-                .rename(columns={"index": "Formation", "formation": "Matches"})
-            )
-            # pandas ≥2.0 value_counts() returns different column names
-            if "count" in form_counts.columns:
-                form_counts = form_counts.rename(columns={"formation": "Formation", "count": "Matches"})
+            # Use explicit column assignment — avoids pandas version differences
+            # in value_counts().reset_index() column naming (pre/post 2.0).
+            _vc = team_forms["formation"].value_counts().reset_index()
+            _vc.columns = ["Formation", "Matches"]
+            form_counts = _vc
 
             if len(form_counts) > 1:
                 st.markdown("### Formation usage")
